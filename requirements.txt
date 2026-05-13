@@ -1,0 +1,28 @@
+# ─── Core Framework ───────────────────────────────────────────
+aiogram==3.15.0
+pydantic==2.11.3
+pydantic-settings==2.9.1
+
+# ─── Database (PostgreSQL + Async SQLAlchemy) ─────────────────
+sqlalchemy[asyncio]==2.0.41
+asyncpg==0.30.0
+alembic==1.15.2
+greenlet==3.2.2
+
+# ─── Cache / Rate Limiting (Redis) ────────────────────────────
+redis[hiredis]==5.3.0
+
+# ─── Webhook Server ───────────────────────────────────────────
+aiohttp==3.11.18
+
+# ─── Environment & Utilities ─────────────────────────────────
+python-dotenv==1.1.0
+structlog==25.4.0
+orjson==3.10.18
+
+# ─── Dev / Testing ───────────────────────────────────────────
+pytest==8.4.0
+pytest-asyncio==1.0.0
+black==25.1.0
+ruff==0.11.12
+mypy==1.16.0

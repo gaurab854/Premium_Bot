@@ -1,0 +1,185 @@
+# ──────────────────────────────────────────────────────────────
+# Docker Compose — Production Deployment
+#
+# Services:
+#   1. bot       — Telegram bot (Aiogram 3.x + webhook mode)
+#   2. postgres  — PostgreSQL 15 (persistent data)
+#   3. redis     — Redis 7 (FSM storage + rate limiting)
+#   4. nginx     — Reverse proxy (SSL termination + IP whitelist)
+#
+# Network topology:
+#   Internet → :443 (nginx) → :8443 (bot) → postgres + redis
+# ──────────────────────────────────────────────────────────────
+
+services:
+  # ════════════════════════════════════════════════════════════
+  #  NGINX — SSL termination + Telegram IP whitelisting
+  # ════════════════════════════════════════════════════════════
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: premium-bot-nginx
+    restart: unless-stopped
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      bot:
+        condition: service_healthy
+    networks:
+      - bot-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ════════════════════════════════════════════════════════════
+  #  BOT — Telegram bot application (webhook mode)
+  # ════════════════════════════════════════════════════════════
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: premium-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Override hosts to use Docker service names
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      # Webhook settings (override in .env for your domain)
+      WEBHOOK_ENABLED: "true"
+      WEBHOOK_HOST: ${WEBHOOK_HOST:-0.0.0.0}
+      WEBHOOK_PORT: "8443"
+    expose:
+      - "8443"    # internal only — nginx proxies to this
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - bot-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+        reservations:
+          memory: 128M
+          cpus: "0.25"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ════════════════════════════════════════════════════════════
+  #  POSTGRESQL 15 — primary data store
+  # ════════════════════════════════════════════════════════════
+  postgres:
+    image: postgres:15-alpine
+    container_name: premium-bot-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-bot_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-supersecretpassword}
+      POSTGRES_DB: ${POSTGRES_DB:-premium_bot}
+      # Performance tuning for small-to-medium workloads
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --locale=en_US.UTF-8"
+    command:
+      - "postgres"
+      - "-c" 
+      - "max_connections=100"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "effective_cache_size=512MB"
+      - "-c"
+      - "work_mem=4MB"
+      - "-c"
+      - "maintenance_work_mem=64MB"
+      - "-c"
+      - "log_min_duration_statement=1000"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # No ports exposed to host — only accessible within Docker network
+    networks:
+      - bot-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bot_user} -d ${POSTGRES_DB:-premium_bot}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "2.0"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  # ════════════════════════════════════════════════════════════
+  #  REDIS 7 — FSM storage + rate limiting
+  # ════════════════════════════════════════════════════════════
+  redis:
+    image: redis:7-alpine
+    container_name: premium-bot-redis
+    restart: unless-stopped
+    command:
+      - "redis-server"
+      - "--appendonly"
+      - "yes"
+      - "--maxmemory"
+      - "128mb"
+      - "--maxmemory-policy"
+      - "allkeys-lru"
+      - "--save"
+      - "60 1000"
+    volumes:
+      - redis_data:/data
+    # No ports exposed to host — only accessible within Docker network
+    networks:
+      - bot-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# ══════════════════════════════════════════════════════════════
+#  VOLUMES — persistent data survives container restarts
+# ══════════════════════════════════════════════════════════════
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+# ══════════════════════════════════════════════════════════════
+#  NETWORK — isolated bridge network
+# ══════════════════════════════════════════════════════════════
+networks:
+  bot-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
