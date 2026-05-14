@@ -49,9 +49,9 @@ LABEL maintainer="Premium Bot Team" \
       description="Production Telegram Bot — Aiogram 3.x" \
       version="1.0.0"
 
+# Ensure the venv's bin is first on PATH
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    # Ensure the venv's bin is first on PATH
     PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /app
@@ -79,9 +79,9 @@ USER botuser
 # Expose the webhook port (used by aiohttp inside the bot)
 EXPOSE 8443
 
-# Health check — verifies the Python process is alive
+# Health check — verifies the webhook server is responding
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD python -c "import sys; sys.exit(0)" || exit 1
+    CMD curl -f http://localhost:${PORT:-8443}/health || exit 1
 
 # Run the bot
 CMD ["python", "-m", "bot"]

@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import logging
 
-import structlog
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -29,6 +28,7 @@ from aiogram.webhook.aiohttp_server import (
 )
 from aiohttp import web
 from redis.asyncio import Redis
+import structlog
 
 from config import settings
 from database import async_engine, Base
@@ -242,17 +242,22 @@ async def main() -> None:
     )
 
     # ── Redis (FSM storage + throttling) ──────────────────────
-    redis = Redis(
-        host=settings.redis.host,
-        port=settings.redis.port,
-        db=settings.redis.db,
-        password=(
-            settings.redis.password.get_secret_value()
-            if settings.redis.password
-            else None
-        ),
-        decode_responses=True,
-    )
+    import os
+    redis_url = os.getenv("REDIS_URL")
+    if redis_url:
+        redis = Redis.from_url(redis_url, decode_responses=True)
+    else:
+        redis = Redis(
+            host=settings.redis.host,
+            port=settings.redis.port,
+            db=settings.redis.db,
+            password=(
+                settings.redis.password.get_secret_value()
+                if settings.redis.password
+                else None
+            ),
+            decode_responses=True,
+        )
     storage = RedisStorage(redis=redis)
 
     # ── Bot & Dispatcher ──────────────────────────────────────

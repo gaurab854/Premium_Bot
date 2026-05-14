@@ -11,6 +11,8 @@ build/
 .venv/
 venv/
 env/
+testenv/
+testenv2/
 
 # ─── Environment Variables ────────────────────────────────────
 .env
