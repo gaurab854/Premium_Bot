@@ -19,6 +19,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # ──────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+from dotenv import load_dotenv
+load_dotenv(BASE_DIR / ".env")
+
+
 
 class BotSettings(BaseSettings):
     """Telegram Bot configuration."""

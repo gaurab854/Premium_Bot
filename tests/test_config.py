@@ -11,6 +11,7 @@ import os
 
 import pytest
 
+os.environ["BOT_TOKEN"] = "test:token"
 
 class TestSettings:
     """Tests for the Settings class."""

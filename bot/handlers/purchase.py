@@ -21,7 +21,7 @@ transaction:
 from __future__ import annotations
 
 import structlog
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -94,7 +94,7 @@ async def cmd_shop(
 # ═════════════════════════════════════════════════════════════
 
 @router.callback_query(
-    ProductCallback.filter(action=ProductAction.VIEW),  # type: ignore[call-arg]
+    ProductCallback.filter(F.action == ProductAction.VIEW),
 )
 async def on_product_view(
     callback: CallbackQuery,
@@ -229,7 +229,7 @@ async def on_back_to_shop(
 # ═════════════════════════════════════════════════════════════
 
 @router.callback_query(
-    ProductCallback.filter(action=ProductAction.BUY),  # type: ignore[call-arg]
+    ProductCallback.filter(F.action == ProductAction.BUY),
 )
 async def on_product_buy(
     callback: CallbackQuery,
