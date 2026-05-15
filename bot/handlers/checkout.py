@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import structlog
 from aiogram import Bot, F, Router
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     CallbackQuery,
