@@ -320,6 +320,7 @@ async def cancel_addstock(message: Message, state: FSMContext) -> None:
 async def process_addstock_codes(
     message: Message,
     state: FSMContext,
+    bot: Bot,
     inventory_repo: InventoryRepository,
     product_repo: ProductRepository,
 ) -> None:
@@ -352,10 +353,35 @@ async def process_addstock_codes(
 
     await message.answer(
         f"✅ <b>Stock Updated!</b>\n\n"
-        f"<b>Product:</b>   {product.name}\n"
-        f"<b>Added:</b>     {count} code(s)\n"
-        f"<b>Total stock:</b> {new_stock} unit(s)"
+        f"<b>Product:</b>    {product.name}\n"
+        f"<b>Added:</b>      {count} code(s)\n"
+        f"<b>Total stock:</b> {new_stock} unit(s)\n\n"
+        f"📢 Sending announcement to the channel..."
     )
+
+    # ── Announce stock restock to channel ────────────────────
+    if settings.bot.channel_id:
+        try:
+            await bot.send_message(
+                settings.bot.channel_id,
+                f"🔄 <b>Stock Restocked!</b>\n\n"
+                f"🛍️ <b>{product.name}</b>\n"
+                f"📦 <b>Available now:</b> {new_stock} unit(s)\n\n"
+                f"👉 Use /shop in the bot to purchase!",
+            )
+            await message.answer("✅ Channel announcement sent!")
+        except Exception as e:
+            logger.warning("Failed to send stock announcement", error=str(e))
+            await message.answer(
+                f"⚠️ Stock added but channel announcement failed: {e}\n"
+                "Make sure the bot is an admin in your channel."
+            )
+    else:
+        await message.answer(
+            "ℹ️ No channel configured. Set <code>BOT_CHANNEL_ID</code> in your .env "
+            "to enable channel announcements."
+        )
+
 
 
 @router.message(Command("delproduct"))
