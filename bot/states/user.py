@@ -70,3 +70,11 @@ class AddPromoForm(StatesGroup):
     waiting_for_description = State()
     waiting_for_max_uses = State()
     waiting_for_product_id = State()
+
+
+class AddStockForm(StatesGroup):
+    """
+    Admin add-stock FSM.
+    Steps: /addstock <id> → waiting_for_codes (admin sends codes one per line)
+    """
+    waiting_for_codes = State()

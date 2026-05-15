@@ -28,6 +28,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.callbacks.purchase import CategoryCallback, ProductAction, ProductCallback
+from bot.callbacks.checkout import CheckoutAction, CheckoutCallback
 from database.repositories.inventory import InventoryRepository
 from database.repositories.order import OrderRepository
 from database.repositories.product import ProductRepository
@@ -54,7 +55,12 @@ async def cmd_shop(
 
     Each product gets a [View] inline button that shows full details.
     """
-    products = await product_repo.get_available()
+    try:
+        products = await product_repo.get_available()
+    except Exception as e:
+        logger.error("Failed to fetch products for /shop", error=str(e))
+        await message.answer("⚠️ Could not load the shop. Please try again later.")
+        return
 
     if not products:
         await message.answer(
@@ -63,31 +69,35 @@ async def cmd_shop(
         )
         return
 
-    builder = InlineKeyboardBuilder()
-    lines: list[str] = ["🏪 <b>Available Products</b>\n"]
+    try:
+        builder = InlineKeyboardBuilder()
+        lines: list[str] = ["🏪 <b>Available Products</b>\n"]
 
-    for p in products:
-        stock = await inventory_repo.count_available(p.id)
-        stock_label = f"({stock} in stock)" if stock > 0 else "(OUT OF STOCK)"
+        for p in products:
+            stock = await inventory_repo.count_available(p.id)
+            stock_label = f"({stock} in stock)" if stock > 0 else "(OUT OF STOCK)"
 
-        lines.append(
-            f"• <b>{p.name}</b> — ${p.price:.2f}  {stock_label}"
+            lines.append(
+                f"• <b>{p.name}</b> — ${p.price:.2f}  {stock_label}"
+            )
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"🔍 {p.name}",
+                    callback_data=ProductCallback(
+                        action=ProductAction.VIEW,
+                        product_id=p.id,
+                    ).pack(),
+                ),
+            )
+
+        lines.append("\n<i>Tap a product to view details and purchase.</i>")
+        await message.answer(
+            "\n".join(lines),
+            reply_markup=builder.as_markup(),
         )
-        builder.row(
-            InlineKeyboardButton(
-                text=f"🔍 {p.name}",
-                callback_data=ProductCallback(
-                    action=ProductAction.VIEW,
-                    product_id=p.id,
-                ).pack(),
-            ),
-        )
-
-    lines.append("\n<i>Tap a product to view details and purchase.</i>")
-    await message.answer(
-        "\n".join(lines),
-        reply_markup=builder.as_markup(),
-    )
+    except Exception as e:
+        logger.error("Failed to render shop", error=str(e))
+        await message.answer("⚠️ Something went wrong loading the shop. Please try again.")
 
 
 # ═════════════════════════════════════════════════════════════
@@ -105,23 +115,38 @@ async def on_product_view(
     wallet_repo: WalletRepository,
     user_repo: UserRepository,
 ) -> None:
-    """Show full product details with a [Buy] confirmation button."""
-    product = await product_repo.get_by_id(callback_data.product_id)
-    if product is None or not product.is_available:
-        await callback.answer("⚠️ Product not found.", show_alert=True)
+    """Show full product details with [Buy] and [Promo Code] buttons."""
+    try:
+        product = await product_repo.get_by_id(callback_data.product_id)
+    except Exception as e:
+        logger.error("Failed to fetch product detail", error=str(e))
+        await callback.answer("⚠️ Could not load product. Try again.", show_alert=True)
         return
 
-    stock = await inventory_repo.count_available(product.id)
+    if product is None or not product.is_available:
+        await callback.answer("⚠️ Product not found or no longer available.", show_alert=True)
+        return
+
+    try:
+        stock = await inventory_repo.count_available(product.id)
+    except Exception as e:
+        logger.error("Failed to fetch stock count", product_id=product.id, error=str(e))
+        await callback.answer("⚠️ Could not load stock info. Try again.", show_alert=True)
+        return
 
     # Get the user's current balance for context
-    db_user = await user_repo.get_by_telegram_id(callback.from_user.id)
     balance = 0.0
-    if db_user:
-        balance = await wallet_repo.get_balance(user_id=db_user.id)
+    try:
+        db_user = await user_repo.get_by_telegram_id(callback.from_user.id)
+        if db_user:
+            balance = await wallet_repo.get_balance(user_id=db_user.id)
+    except Exception as e:
+        logger.warning("Failed to fetch user balance for product view", error=str(e))
+        # Non-fatal — show product anyway with $0 balance
 
     # ── Build detail text ─────────────────────────────────────
     description = product.description or "No description available."
-    can_afford = "✅ You can afford this" if balance >= product.price else "❌ Insufficient balance"
+    can_afford = "✅ You can afford this" if balance >= product.price else "❌ Insufficient balance — use /deposit"
     stock_text = f"📦 {stock} in stock" if stock > 0 else "🚫 OUT OF STOCK"
 
     text = (
@@ -136,12 +161,19 @@ async def on_product_view(
     # ── Build inline keyboard ─────────────────────────────────
     builder = InlineKeyboardBuilder()
 
-    if stock > 0 and balance >= product.price:
+    if stock > 0:
         builder.row(
             InlineKeyboardButton(
                 text=f"💳 Buy for ${product.price:.2f}",
                 callback_data=ProductCallback(
                     action=ProductAction.BUY,
+                    product_id=product.id,
+                ).pack(),
+            ),
+            InlineKeyboardButton(
+                text="🎁 Promo Code",
+                callback_data=CheckoutCallback(
+                    action=CheckoutAction.PROMO,
                     product_id=product.id,
                 ).pack(),
             ),
@@ -154,10 +186,15 @@ async def on_product_view(
         ),
     )
 
-    await callback.message.edit_text(
-        text,
-        reply_markup=builder.as_markup(),
-    )
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=builder.as_markup(),
+        )
+    except Exception as e:
+        logger.warning("Failed to edit product view message", error=str(e))
+        await callback.message.answer(text, reply_markup=builder.as_markup())
+
     await callback.answer()
 
 
@@ -172,37 +209,51 @@ async def on_back_to_shop(
     inventory_repo: InventoryRepository,
 ) -> None:
     """Re-render the shop catalogue inline (avoids /shop re-send)."""
-    products = await product_repo.get_available()
+    try:
+        products = await product_repo.get_available()
+    except Exception as e:
+        logger.error("Failed to fetch products for back_to_shop", error=str(e))
+        await callback.answer("⚠️ Could not reload shop. Try /shop again.", show_alert=True)
+        return
 
     if not products:
-        await callback.message.edit_text(
-            "🏪 <b>Shop</b>\n\nNo products available at the moment."
-        )
+        try:
+            await callback.message.edit_text(
+                "🏪 <b>Shop</b>\n\nNo products available at the moment."
+            )
+        except Exception:
+            pass
         await callback.answer()
         return
 
-    builder = InlineKeyboardBuilder()
-    lines: list[str] = ["🏪 <b>Available Products</b>\n"]
+    try:
+        builder = InlineKeyboardBuilder()
+        lines: list[str] = ["🏪 <b>Available Products</b>\n"]
 
-    for p in products:
-        stock = await inventory_repo.count_available(p.id)
-        stock_label = f"({stock} in stock)" if stock > 0 else "(OUT OF STOCK)"
-        lines.append(f"• <b>{p.name}</b> — ${p.price:.2f}  {stock_label}")
-        builder.row(
-            InlineKeyboardButton(
-                text=f"🔍 {p.name}",
-                callback_data=ProductCallback(
-                    action=ProductAction.VIEW,
-                    product_id=p.id,
-                ).pack(),
-            ),
+        for p in products:
+            stock = await inventory_repo.count_available(p.id)
+            stock_label = f"({stock} in stock)" if stock > 0 else "(OUT OF STOCK)"
+            lines.append(f"• <b>{p.name}</b> — ${p.price:.2f}  {stock_label}")
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"🔍 {p.name}",
+                    callback_data=ProductCallback(
+                        action=ProductAction.VIEW,
+                        product_id=p.id,
+                    ).pack(),
+                ),
+            )
+
+        lines.append("\n<i>Tap a product to view details and purchase.</i>")
+        await callback.message.edit_text(
+            "\n".join(lines),
+            reply_markup=builder.as_markup(),
         )
+    except Exception as e:
+        logger.error("Failed to render back_to_shop", error=str(e))
+        await callback.answer("⚠️ Could not reload shop. Try /shop again.", show_alert=True)
+        return
 
-    lines.append("\n<i>Tap a product to view details and purchase.</i>")
-    await callback.message.edit_text(
-        "\n".join(lines),
-        reply_markup=builder.as_markup(),
-    )
     await callback.answer()
 
 
@@ -223,12 +274,24 @@ async def cmd_orders(
     order_repo: OrderRepository,
 ) -> None:
     """Display the user's recent order history."""
-    db_user = await user_repo.get_by_telegram_id(message.from_user.id)
+    try:
+        db_user = await user_repo.get_by_telegram_id(message.from_user.id)
+    except Exception as e:
+        logger.error("Failed to fetch user for /orders", error=str(e))
+        await message.answer("⚠️ Could not load your profile. Please try again.")
+        return
+
     if not db_user:
         await message.answer("⚠️ Please /start first to register.")
         return
 
-    orders = await order_repo.get_by_user(db_user.id, limit=10)
+    try:
+        orders = await order_repo.get_by_user(db_user.id, limit=10)
+        total_count = await order_repo.count_by_user(db_user.id)
+    except Exception as e:
+        logger.error("Failed to fetch orders", user_id=db_user.id, error=str(e))
+        await message.answer("⚠️ Could not load your orders. Please try again later.")
+        return
 
     if not orders:
         await message.answer(
@@ -253,7 +316,6 @@ async def cmd_orders(
             f"{o.created_at:%Y-%m-%d %H:%M}"
         )
 
-    total_count = await order_repo.count_by_user(db_user.id)
     lines.append(f"\n<i>Showing {len(orders)} of {total_count} total orders.</i>")
 
     await message.answer("\n".join(lines))

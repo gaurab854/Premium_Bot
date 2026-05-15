@@ -128,3 +128,49 @@ class ProductRepository:
             .values(price=new_price)
         )
         await self._session.execute(stmt)
+
+    # ─────────────────────────────────────────────────────────
+    #  DELETE
+    # ─────────────────────────────────────────────────────────
+    async def hard_delete(self, product_id: int) -> bool:
+        """
+        Permanently delete a product and all its unsold inventory from the DB.
+
+        Sold inventory items are kept for order history integrity.
+        After deletion the PostgreSQL sequence is reset to the lowest
+        available gap so new products reuse freed IDs.
+
+        Returns True if the product existed and was deleted, False if not found.
+        """
+        from sqlalchemy import delete, text
+        from database.models.inventory import Inventory
+
+        product = await self._session.get(Product, product_id)
+        if product is None:
+            return False
+
+        # Delete unsold inventory for this product
+        await self._session.execute(
+            delete(Inventory).where(
+                Inventory.product_id == product_id,
+                Inventory.is_sold.is_(False),
+            )
+        )
+
+        # Hard-delete the product row
+        await self._session.delete(product)
+        await self._session.flush()
+
+        # Reset sequence to fill ID gaps — next product reuses the lowest free ID
+        await self._session.execute(
+            text(
+                """
+                SELECT setval(
+                    pg_get_serial_sequence('products', 'id'),
+                    COALESCE((SELECT MAX(id) FROM products), 0)
+                )
+                """
+            )
+        )
+
+        return True

@@ -19,8 +19,11 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from bot.callbacks.purchase import ProductAction, ProductCallback
 from config import settings
+from database.repositories.inventory import InventoryRepository
 from database.repositories.order import OrderRepository
+from database.repositories.product import ProductRepository
 from database.repositories.user import UserRepository
 from database.repositories.wallet import WalletRepository
 
@@ -309,8 +312,43 @@ async def cb_open_help(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "open_shop")
-async def cb_open_shop(callback: CallbackQuery) -> None:
-    await callback.message.answer("🏪 Use /shop to browse our products!")
+async def cb_open_shop(
+    callback: CallbackQuery,
+    product_repo: ProductRepository,
+    inventory_repo: InventoryRepository,
+) -> None:
+    """Render the shop directly — same as /shop command."""
+    products = await product_repo.get_available()
+
+    if not products:
+        await callback.message.answer(
+            "🏪 <b>Shop</b>\n\nNo products available at the moment. Check back later!"
+        )
+        await callback.answer()
+        return
+
+    builder = InlineKeyboardBuilder()
+    lines: list[str] = ["🏪 <b>Available Products</b>\n"]
+
+    for p in products:
+        stock = await inventory_repo.count_available(p.id)
+        stock_label = f"({stock} in stock)" if stock > 0 else "(OUT OF STOCK)"
+        lines.append(f"• <b>{p.name}</b> — ${p.price:.2f}  {stock_label}")
+        builder.row(
+            InlineKeyboardButton(
+                text=f"🔍 {p.name}",
+                callback_data=ProductCallback(
+                    action=ProductAction.VIEW,
+                    product_id=p.id,
+                ).pack(),
+            )
+        )
+
+    lines.append("\n<i>Tap a product to view details and purchase.</i>")
+    await callback.message.answer(
+        "\n".join(lines),
+        reply_markup=builder.as_markup(),
+    )
     await callback.answer()
 
 

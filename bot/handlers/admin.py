@@ -30,7 +30,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.callbacks.deposit import DepositAction, DepositCallback
 from bot.filters.admin import AdminFilter
-from bot.states.user import AddProductForm, AddPromoForm
+from bot.states.user import AddProductForm, AddPromoForm, AddStockForm
 from config import settings
 from database import async_session_factory
 from database.repositories.deposit import DepositRepository
@@ -260,6 +260,7 @@ async def cmd_products(
 @router.message(Command("addstock"))
 async def cmd_addstock(
     message: Message,
+    state: FSMContext,
     product_repo: ProductRepository,
     inventory_repo: InventoryRepository,
 ) -> None:
@@ -289,16 +290,60 @@ async def cmd_addstock(
         return
 
     stock = await inventory_repo.count_available(product_id)
+
+    # ── Set FSM state so the next message is captured as codes ──
+    await state.set_state(AddStockForm.waiting_for_codes)
+    await state.update_data(addstock_product_id=product_id)
+
     await message.answer(
         f"📦 <b>Adding stock to: {product.name}</b>\n"
         f"Current stock: {stock} unit(s)\n\n"
-        f"Please send the codes now, <b>one per line</b>:\n"
+        f"Now send the codes, <b>one per line</b>:\n"
         f"<code>CODE1\nCODE2\nCODE3</code>\n\n"
-        f"⚠️ This is a one-time message — make sure your codes are ready."
+        f"Send /cancel to abort."
     )
 
-    # We store product_id in FSM so next message handler can pick it up
-    # We use a simple trick: set state data so the fallback below handles it
+
+@router.message(AddStockForm.waiting_for_codes, F.text)
+async def process_addstock_codes(
+    message: Message,
+    state: FSMContext,
+    inventory_repo: InventoryRepository,
+    product_repo: ProductRepository,
+) -> None:
+    """Receive codes for /addstock and bulk-insert into inventory."""
+    raw = message.text.strip()
+    codes = [line.strip() for line in raw.splitlines() if line.strip()]
+
+    if not codes:
+        await message.answer("⚠️ No codes found. Send at least one code (one per line).")
+        return
+
+    fsm_data = await state.get_data()
+    product_id = fsm_data.get("addstock_product_id")
+    await state.clear()
+
+    product = await product_repo.get_by_id(product_id)
+    if not product:
+        await message.answer(f"⚠️ Product #{product_id} no longer exists.")
+        return
+
+    count = await inventory_repo.add_bulk(product_id, codes)
+    new_stock = await inventory_repo.count_available(product_id)
+
+    logger.info(
+        "Stock added",
+        product_id=product_id,
+        codes_added=count,
+        new_total=new_stock,
+    )
+
+    await message.answer(
+        f"✅ <b>Stock Updated!</b>\n\n"
+        f"<b>Product:</b>   {product.name}\n"
+        f"<b>Added:</b>     {count} code(s)\n"
+        f"<b>Total stock:</b> {new_stock} unit(s)"
+    )
 
 
 @router.message(Command("delproduct"))
@@ -307,8 +352,13 @@ async def cmd_delproduct(
     product_repo: ProductRepository,
 ) -> None:
     """
-    Toggle product visibility.
+    Permanently delete a product from the database.
     Usage: /delproduct <product_id>
+
+    - Removes the product row completely
+    - Deletes all unsold inventory codes for that product
+    - Resets the ID sequence so the next product reuses freed IDs
+    - Sold inventory is kept for order history
     """
     args = message.text.split(maxsplit=1)
     if len(args) < 2 or not args[1].strip().isdigit():
@@ -321,15 +371,19 @@ async def cmd_delproduct(
         await message.answer(f"⚠️ Product #{product_id} not found.")
         return
 
-    # Toggle availability
-    new_status = not product.is_available
-    await product_repo.set_available(product_id, available=new_status)
+    product_name = product.name  # save before deletion
 
-    emoji = "✅" if new_status else "🚫"
-    status = "shown" if new_status else "hidden"
-    await message.answer(
-        f"{emoji} Product <b>#{product_id} — {product.name}</b> is now <b>{status}</b>."
-    )
+    deleted = await product_repo.hard_delete(product_id)
+    if deleted:
+        await message.answer(
+            f"🗑️ <b>Product Permanently Deleted</b>\n\n"
+            f"<b>ID:</b>    #{product_id}\n"
+            f"<b>Name:</b>  {product_name}\n\n"
+            f"✅ All unsold inventory codes removed.\n"
+            f"♻️ ID #{product_id} will be reused for the next product."
+        )
+    else:
+        await message.answer(f"⚠️ Failed to delete product #{product_id}.")
 
 
 # ═════════════════════════════════════════════════════════════════════════════

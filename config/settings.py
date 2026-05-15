@@ -37,7 +37,7 @@ class BotSettings(BaseSettings):
 
     token: SecretStr
     admin_ids: List[int] = []
-    channel_id: Optional[int] = None   # e.g. -1001234567890
+    channel_id: Optional[str] = None   # accepts -1001234567890 or @username
     channel_username: Optional[str] = None  # e.g. @mychannelname
 
     model_config = SettingsConfigDict(env_prefix="BOT_")
@@ -57,6 +57,22 @@ class BotSettings(BaseSettings):
             parts = [p.strip() for p in v.split(",") if p.strip()]
             return [int(p) for p in parts] if parts else []
         return v
+
+    @field_validator("channel_id", mode="before")
+    @classmethod
+    def _parse_channel_id(cls, v):
+        """
+        Accept:
+          - an integer like -1003941275993
+          - a string integer like '-1003941275993'
+          - a @username string like '@Premium_Products_News'
+        Returns a string that Telegram Bot API accepts for both
+        get_chat_member() and send_message().
+        """
+        if v is None or v == "":
+            return None
+        v = str(v).strip()
+        return v  # pass through as-is — Telegram API accepts both forms
 
 
 
