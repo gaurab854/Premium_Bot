@@ -23,6 +23,7 @@ from database.repositories.inventory import InventoryRepository
 from database.repositories.deposit import DepositRepository
 from database.repositories.product import ProductRepository
 from database.repositories.order import OrderRepository
+from database.repositories.promo_code import PromoCodeRepository
 
 
 class DatabaseMiddleware(BaseMiddleware):
@@ -58,6 +59,7 @@ class DatabaseMiddleware(BaseMiddleware):
             data["deposit_repo"] = DepositRepository(session)
             data["product_repo"] = ProductRepository(session)
             data["order_repo"] = OrderRepository(session)
+            data["promo_repo"] = PromoCodeRepository(session)
 
             try:
                 result = await handler(event, data)

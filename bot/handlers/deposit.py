@@ -1,20 +1,28 @@
 """
-Deposit handler — the user-facing manual deposit flow.
+Deposit handler — user-facing deposit flow with payment method selection.
+
+Payment methods supported:
+    1. Bybit UID   : 547991243
+    2. BEP-20      : 0xe40b02a757bb2714d4671812dc66254dd1e8ebd9
+    3. Plasma      : 0xe40b02a757bb2714d4671812dc66254dd1e8ebd9
 
 Flow:
-    /deposit  →  ask amount  →  ask TXID  →  save pending deposit  →  alert admins
-
-Uses Aiogram 3.x FSM (Finite State Machine) to collect input
-across multiple messages without conflicting with other commands.
+    /deposit  →  choose payment method  →  show address / UID
+              →  user sends amount      →  user sends transaction hash
+              →  save pending deposit   →  alert admins with Approve/Reject
 """
 
 from __future__ import annotations
 
 import structlog
-from aiogram import Bot, Router, F
+from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    Message,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.callbacks.deposit import DepositAction, DepositCallback
@@ -22,70 +30,174 @@ from bot.states.user import DepositForm
 from config import settings
 from database.repositories.deposit import DepositRepository
 from database.repositories.user import UserRepository
-from database.repositories.wallet import WalletRepository
 
 logger = structlog.get_logger()
 
 router = Router(name="deposit")
 
+# ── Payment methods ────────────────────────────────────────────────────────
+PAYMENT_METHODS = {
+    "bybit": {
+        "label": "🟡 Bybit UID",
+        "display": "Bybit UID",
+        "value": "547991243",
+        "instructions": (
+            "📌 <b>How to pay via Bybit:</b>\n\n"
+            "1️⃣ Open Bybit → <b>Assets</b> → <b>P2P / Transfer</b>\n"
+            "2️⃣ Transfer to UID: <code>547991243</code>\n"
+            "3️⃣ Copy your <b>Transaction ID / Hash</b> after sending\n"
+            "4️⃣ Come back here and send it to us"
+        ),
+    },
+    "bep20": {
+        "label": "🔵 BEP-20 (USDT/BNB)",
+        "display": "BEP-20",
+        "value": "0xe40b02a757bb2714d4671812dc66254dd1e8ebd9",
+        "instructions": (
+            "📌 <b>How to pay via BEP-20:</b>\n\n"
+            "1️⃣ Open your wallet (Trust Wallet / MetaMask / Binance)\n"
+            "2️⃣ Send USDT or BNB on the <b>BEP-20 (BSC)</b> network to:\n"
+            "<code>0xe40b02a757bb2714d4671812dc66254dd1e8ebd9</code>\n"
+            "3️⃣ Copy your <b>Transaction Hash (TxID)</b> from BscScan\n"
+            "4️⃣ Come back here and send it to us"
+        ),
+    },
+    "plasma": {
+        "label": "🟣 Plasma (USDT)",
+        "display": "Plasma (USDT)",
+        "value": "0xe40b02a757bb2714d4671812dc66254dd1e8ebd9",
+        "instructions": (
+            "📌 <b>How to pay via Plasma (USDT):</b>\n\n"
+            "1️⃣ Open your Plasma-compatible wallet\n"
+            "2️⃣ Send <b>USDT</b> on the Plasma network to:\n"
+            "<code>0xe40b02a757bb2714d4671812dc66254dd1e8ebd9</code>\n"
+            "3️⃣ Copy your <b>Transaction Hash (TxID)</b>\n"
+            "4️⃣ Come back here and send it to us"
+        ),
+    },
+}
 
-# ─────────────────────────────────────────────────────────────
-#  STEP 1:  /deposit  →  ask for amount
-# ─────────────────────────────────────────────────────────────
+
+def _payment_method_keyboard():
+    builder = InlineKeyboardBuilder()
+    for key, method in PAYMENT_METHODS.items():
+        builder.row(
+            InlineKeyboardButton(
+                text=method["label"],
+                callback_data=f"pay_method:{key}",
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_deposit"),
+    )
+    return builder.as_markup()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 1:  /deposit → choose payment method
+# ─────────────────────────────────────────────────────────────────────────────
+
 @router.message(Command("deposit"))
 async def cmd_deposit(message: Message, state: FSMContext) -> None:
-    """Start the deposit flow — prompt the user for the deposit amount."""
-    await state.set_state(DepositForm.waiting_for_amount)
+    """Start the deposit flow — prompt user to select a payment method."""
+    await state.clear()
     await message.answer(
-        "💰 <b>Manual Deposit</b>\n\n"
-        "Please enter the <b>deposit amount</b> in USD.\n\n"
-        "<i>Example: 25.00</i>\n\n"
-        "Send /cancel at any time to abort.",
+        "💳 <b>Add Funds — Choose Payment Method</b>\n\n"
+        "Select how you would like to pay:",
+        reply_markup=_payment_method_keyboard(),
     )
 
 
-# ─────────────────────────────────────────────────────────────
-#  STEP 2:  receive amount  →  ask for TXID
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 2:  User picks a payment method → show address + ask for amount
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("pay_method:"))
+async def on_payment_method_selected(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    method_key = callback.data.split(":")[1]
+    method = PAYMENT_METHODS.get(method_key)
+
+    if not method:
+        await callback.answer("Invalid method.", show_alert=True)
+        return
+
+    await state.update_data(payment_method=method_key)
+    await state.set_state(DepositForm.waiting_for_amount)
+
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_deposit"),
+    )
+
+    await callback.message.edit_text(
+        f"{method['instructions']}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>How much are you depositing? (in USD)</b>\n\n"
+        f"<i>Example: 25.00</i>\n\n"
+        f"Send /cancel at any time to abort.",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cancel_deposit")
+async def on_cancel_deposit_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.message.edit_text("❌ Deposit cancelled.")
+    await callback.answer()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 3:  User sends amount → ask for transaction hash
+# ─────────────────────────────────────────────────────────────────────────────
+
 @router.message(DepositForm.waiting_for_amount, F.text)
 async def process_amount(message: Message, state: FSMContext) -> None:
-    """Validate the deposit amount and ask for the TXID."""
+    """Validate the deposit amount and ask for the transaction hash."""
     raw = message.text.strip()
 
-    # ── Validate amount ───────────────────────────────────────
     try:
         amount = float(raw)
     except ValueError:
         await message.answer(
             "⚠️ Invalid number. Please enter a valid amount (e.g. <code>25.00</code>)."
         )
-        return  # stay in the same state
+        return
 
     if amount <= 0:
         await message.answer("⚠️ Amount must be greater than zero.")
         return
 
     if amount > 100_000:
-        await message.answer("⚠️ Maximum deposit is $100,000. Please enter a smaller amount.")
+        await message.answer("⚠️ Maximum deposit is $100,000.")
         return
 
-    # ── Store amount in FSM data and advance to next state ────
+    fsm_data = await state.get_data()
+    method_key = fsm_data.get("payment_method", "bep20")
+    method = PAYMENT_METHODS[method_key]
+
     await state.update_data(deposit_amount=amount)
     await state.set_state(DepositForm.waiting_for_txid)
 
     await message.answer(
-        f"✅ Amount: <b>${amount:.2f}</b>\n\n"
-        "Now please send the <b>Transaction ID (TXID)</b> "
-        "from your payment.\n\n"
-        "<i>This is the hash or reference number from your "
-        "wallet / payment provider.</i>\n\n"
-        "Send /cancel to abort.",
+        f"✅ Amount: <b>${amount:.2f}</b>\n"
+        f"Method: <b>{method['display']}</b>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 Now send your <b>Transaction Hash / TXID</b> "
+        f"from the payment you made to:\n"
+        f"<code>{method['value']}</code>\n\n"
+        f"<i>Paste the full hash — it will be verified by an admin.</i>\n\n"
+        f"Send /cancel to abort."
     )
 
 
-# ─────────────────────────────────────────────────────────────
-#  STEP 3:  receive TXID  →  save deposit  →  alert admins
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 4:  User sends TXID → save deposit → alert admins
+# ─────────────────────────────────────────────────────────────────────────────
+
 @router.message(DepositForm.waiting_for_txid, F.text)
 async def process_txid(
     message: Message,
@@ -95,12 +207,11 @@ async def process_txid(
     deposit_repo: DepositRepository,
 ) -> None:
     """
-    Validate the TXID, save a PENDING deposit, and send an
-    approval request to every admin with Approve/Reject buttons.
+    Validate the TXID, save a PENDING deposit, and notify admins
+    with Approve / Reject inline buttons.
     """
     txid = message.text.strip()
 
-    # ── Validate TXID format ──────────────────────────────────
     if len(txid) < 6:
         await message.answer(
             "⚠️ That TXID looks too short. "
@@ -112,28 +223,26 @@ async def process_txid(
         await message.answer("⚠️ TXID is too long (max 256 characters).")
         return
 
-    # ── Check for duplicate TXID ──────────────────────────────
     existing = await deposit_repo.get_by_txid(txid)
     if existing is not None:
         await message.answer(
             "⚠️ This TXID has already been submitted. "
-            "Please check your deposit history or contact support."
+            "Please contact support if you believe this is an error."
         )
         await state.clear()
         return
 
-    # ── Get the DB user ───────────────────────────────────────
     db_user = await user_repo.get_by_telegram_id(message.from_user.id)
     if not db_user:
         await message.answer("⚠️ You are not registered. Please /start first.")
         await state.clear()
         return
 
-    # ── Retrieve amount from FSM data ─────────────────────────
     fsm_data = await state.get_data()
     amount = fsm_data["deposit_amount"]
+    method_key = fsm_data.get("payment_method", "bep20")
+    method = PAYMENT_METHODS[method_key]
 
-    # ── Create the PENDING deposit ────────────────────────────
     deposit = await deposit_repo.create(
         user_id=db_user.id,
         txid=txid,
@@ -144,25 +253,24 @@ async def process_txid(
         "Deposit created",
         deposit_id=deposit.id,
         user_id=db_user.id,
-        telegram_id=db_user.telegram_id,
+        method=method_key,
         txid=txid,
         amount=amount,
     )
 
-    # ── Clear the FSM — flow is complete for the user ─────────
     await state.clear()
 
-    # ── Confirm to the user ───────────────────────────────────
     await message.answer(
         f"✅ <b>Deposit Submitted!</b>\n\n"
-        f"<b>Amount:</b>  ${amount:.2f}\n"
-        f"<b>TXID:</b>    <code>{txid}</code>\n"
-        f"<b>Status:</b>  ⏳ Pending review\n\n"
+        f"<b>Amount:</b>   ${amount:.2f}\n"
+        f"<b>Method:</b>   {method['display']}\n"
+        f"<b>TXID:</b>     <code>{txid}</code>\n"
+        f"<b>Status:</b>   ⏳ Pending review\n\n"
         f"An admin will verify your transaction shortly.\n"
-        f"You'll be notified once it's approved.",
+        f"You'll be notified once it's approved or rejected."
     )
 
-    # ── Build Approve / Reject inline keyboard ────────────────
+    # ── Build Approve / Reject keyboard for admins ─────────────
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
@@ -181,7 +289,6 @@ async def process_txid(
         ),
     )
 
-    # ── Alert every admin ─────────────────────────────────────
     admin_text = (
         f"🔔 <b>New Deposit Request</b>\n\n"
         f"<b>Deposit ID:</b>  #{deposit.id}\n"
@@ -189,6 +296,8 @@ async def process_txid(
         f"(@{db_user.username or '—'})\n"
         f"<b>Telegram ID:</b> <code>{db_user.telegram_id}</code>\n"
         f"<b>Amount:</b>      ${amount:.2f}\n"
+        f"<b>Method:</b>      {method['display']}\n"
+        f"<b>Address:</b>     <code>{method['value']}</code>\n"
         f"<b>TXID:</b>        <code>{txid}</code>\n"
         f"<b>Status:</b>      ⏳ Pending"
     )
@@ -208,9 +317,10 @@ async def process_txid(
             )
 
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 #  CANCEL — abort the deposit flow from any state
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
 @router.message(DepositForm.waiting_for_amount, Command("cancel"))
 @router.message(DepositForm.waiting_for_txid, Command("cancel"))
 async def cmd_cancel_deposit(message: Message, state: FSMContext) -> None:

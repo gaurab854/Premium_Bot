@@ -53,7 +53,7 @@ class Order(Base):
     status: Mapped[OrderStatus] = mapped_column(
         Enum(OrderStatus, name="order_status", create_constraint=True),
         default=OrderStatus.PENDING,
-        server_default="pending",
+        server_default="PENDING",
         nullable=False,
         index=True,
         comment="Current order status",

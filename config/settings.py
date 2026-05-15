@@ -37,8 +37,27 @@ class BotSettings(BaseSettings):
 
     token: SecretStr
     admin_ids: List[int] = []
+    channel_id: Optional[int] = None   # e.g. -1001234567890
+    channel_username: Optional[str] = None  # e.g. @mychannelname
 
     model_config = SettingsConfigDict(env_prefix="BOT_")
+
+    @field_validator("admin_ids", mode="before")
+    @classmethod
+    def _parse_admin_ids(cls, v):
+        """Accept int, '1234', '[1234]', '1234,5678', or a list."""
+        if isinstance(v, list):
+            return [int(x) for x in v]
+        if isinstance(v, int):
+            return [v]
+        if isinstance(v, str):
+            v = v.strip()
+            if v.startswith("[") and v.endswith("]"):
+                v = v[1:-1]
+            parts = [p.strip() for p in v.split(",") if p.strip()]
+            return [int(p) for p in parts] if parts else []
+        return v
+
 
 
 class PostgresSettings(BaseSettings):

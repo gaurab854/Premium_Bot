@@ -51,7 +51,7 @@ services:
       POSTGRES_HOST: postgres
       REDIS_HOST: redis
       # Webhook settings (override in .env for your domain)
-      WEBHOOK_ENABLED: "true"
+      WEBHOOK_ENABLED: "false"
       WEBHOOK_HOST: ${WEBHOOK_HOST:-0.0.0.0}
       WEBHOOK_PORT: "8443"
     expose:

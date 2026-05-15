@@ -58,7 +58,7 @@ class Deposit(Base):
     status: Mapped[DepositStatus] = mapped_column(
         Enum(DepositStatus, name="deposit_status", create_constraint=True),
         default=DepositStatus.PENDING,
-        server_default="pending",
+        server_default="PENDING",
         nullable=False,
         index=True,
         comment="Current deposit status",

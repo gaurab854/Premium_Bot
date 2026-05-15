@@ -15,6 +15,8 @@ from database.models.inventory import Inventory
 from database.models.order import Order, OrderStatus
 from database.models.order_item import OrderItem
 from database.models.admin_log import AdminLog
+from database.models.promo_code import PromoCode
+from database.models.promo_order_request import PromoOrderRequest, PromoOrderStatus
 
 __all__ = [
     # Models
@@ -27,9 +29,12 @@ __all__ = [
     "Order",
     "OrderItem",
     "AdminLog",
+    "PromoCode",
+    "PromoOrderRequest",
     # Enums
     "TransactionType",
     "TransactionStatus",
     "DepositStatus",
     "OrderStatus",
+    "PromoOrderStatus",
 ]

@@ -34,11 +34,12 @@ from config import settings
 from database import async_engine, Base
 
 # ── Import routers ────────────────────────────────────────────
-from bot.handlers import common, admin, user, deposit, purchase
+from bot.handlers import common, admin, user, deposit, purchase, checkout
 
 # ── Import middleware ─────────────────────────────────────────
 from bot.middlewares.database import DatabaseMiddleware
 from bot.middlewares.throttling import ThrottlingMiddleware
+from bot.middlewares.channel import ChannelMemberMiddleware
 
 
 # ══════════════════════════════════════════════════════════════
@@ -124,6 +125,9 @@ def _build_dispatcher(storage: RedisStorage) -> Dispatcher:
     dp.shutdown.register(on_shutdown)
 
     # ── Register middleware (outer → inner) ───────────────────
+    # Channel gate runs FIRST (outermost) so non-members can't bypass it
+    dp.message.middleware(ChannelMemberMiddleware())
+    dp.callback_query.middleware(ChannelMemberMiddleware())
     dp.message.middleware(DatabaseMiddleware())
     dp.callback_query.middleware(DatabaseMiddleware())
     dp.message.middleware(ThrottlingMiddleware(rate_limit=settings.rate_limit))
@@ -131,8 +135,9 @@ def _build_dispatcher(storage: RedisStorage) -> Dispatcher:
     # ── Include routers ───────────────────────────────────────
     dp.include_routers(
         admin.router,      # admin-only commands + deposit callbacks
+        checkout.router,   # checkout gateway (Pay / Promo Code) + promo approval
         deposit.router,    # user deposit FSM flow
-        purchase.router,   # product browsing + purchase flow
+        purchase.router,   # product browsing + order history
         user.router,
         common.router,     # catch-all last
     )

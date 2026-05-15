@@ -21,6 +21,7 @@ transaction:
 from __future__ import annotations
 
 import structlog
+# pyrefly: ignore [missing-import]
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
@@ -205,167 +206,10 @@ async def on_back_to_shop(
     await callback.answer()
 
 
-# ═════════════════════════════════════════════════════════════
-#  [Buy] — THE PURCHASE FLOW (the critical path)
-# ═════════════════════════════════════════════════════════════
-#
-#  This handler is the single most important function in the bot.
-#  It performs FOUR database mutations in one atomic transaction:
-#
-#    1. lock_available_item()  → SELECT … FOR UPDATE SKIP LOCKED
-#    2. deduct_balance()       → UPDATE wallets SET balance = balance - price
-#                                WHERE balance >= price
-#    3. mark_as_sold()         → UPDATE inventory SET is_sold = true
-#    4. create_full_order()    → INSERT orders + INSERT order_items
-#
-#  All four run on the SAME session.  The middleware auto-commits
-#  on success and auto-rollbacks on any exception.
-#
-#  If ANY step fails, the entire transaction rolls back:
-#    • Locked inventory is released (goes back to available pool)
-#    • Wallet balance is untouched
-#    • No orphan order records
-#
-# ═════════════════════════════════════════════════════════════
-
-@router.callback_query(
-    ProductCallback.filter(F.action == ProductAction.BUY),
-)
-async def on_product_buy(
-    callback: CallbackQuery,
-    callback_data: ProductCallback,
-    user_repo: UserRepository,
-    wallet_repo: WalletRepository,
-    inventory_repo: InventoryRepository,
-    product_repo: ProductRepository,
-    order_repo: OrderRepository,
-) -> None:
-    """
-    Execute the full purchase flow:
-      1. Validate product exists & is available
-      2. Validate user is registered
-      3. Lock an inventory item (FOR UPDATE SKIP LOCKED)
-      4. Deduct wallet balance (atomic WHERE guard)
-      5. Mark inventory as sold
-      6. Create order + order_item records
-      7. Send the digital code to the user via spoiler text
-
-    The entire sequence runs on a single DB session/transaction.
-    """
-    product_id = callback_data.product_id
-
-    # ── 1. Validate product ───────────────────────────────────
-    product = await product_repo.get_by_id(product_id)
-    if product is None or not product.is_available:
-        await callback.answer("⚠️ Product is no longer available.", show_alert=True)
-        return
-
-    # ── 2. Validate user ──────────────────────────────────────
-    db_user = await user_repo.get_by_telegram_id(callback.from_user.id)
-    if not db_user:
-        await callback.answer("⚠️ Please /start first to register.", show_alert=True)
-        return
-
-    wallet = await wallet_repo.get_or_create(user_id=db_user.id)
-
-    # ── Quick balance pre-check (non-authoritative) ───────────
-    if wallet.balance < product.price:
-        await callback.answer(
-            f"❌ Insufficient balance: ${wallet.balance:.2f} < ${product.price:.2f}",
-            show_alert=True,
-        )
-        return
-
-    # ── 3. Lock an inventory item ─────────────────────────────
-    #    SELECT … FOR UPDATE SKIP LOCKED
-    #    Returns None if no unsold & unlocked rows remain.
-    locked_item = await inventory_repo.lock_available_item(product_id)
-
-    if locked_item is None:
-        await callback.message.edit_text(
-            f"😔 <b>Out of Stock</b>\n\n"
-            f"<b>{product.name}</b> is currently sold out.\n"
-            f"Please check back later!",
-        )
-        await callback.answer("Out of stock!", show_alert=True)
-        return
-
-    # ── 4. Deduct wallet balance (atomic) ─────────────────────
-    #    UPDATE wallets SET balance = balance - price
-    #    WHERE id = :wid AND balance >= :price
-    #    Returns False if insufficient funds (race-safe).
-    deducted = await wallet_repo.deduct_balance(
-        wallet_id=wallet.id,
-        amount=product.price,
-    )
-
-    if not deducted:
-        # Balance was insufficient at the DB level
-        # (could happen if another purchase was processed concurrently)
-        # The transaction will roll back → inventory lock is released.
-        await callback.message.edit_text(
-            f"❌ <b>Insufficient Balance</b>\n\n"
-            f"Your balance is less than ${product.price:.2f}.\n"
-            f"Use /deposit to add funds.",
-        )
-        await callback.answer("Insufficient balance!", show_alert=True)
-        # Raise to trigger rollback and release the inventory lock
-        raise ValueError("Insufficient balance — triggering rollback")
-
-    # ── 5. Mark inventory as sold ─────────────────────────────
-    await inventory_repo.mark_as_sold(
-        inventory_id=locked_item.id,
-        buyer_id=db_user.id,
-    )
-
-    # ── 6. Create order + order_item ──────────────────────────
-    order, order_item = await order_repo.create_full_order(
-        user_id=db_user.id,
-        product_id=product.id,
-        inventory_id=locked_item.id,
-        price=product.price,
-        quantity=1,
-    )
-
-    logger.info(
-        "Purchase completed",
-        order_id=order.id,
-        product_id=product.id,
-        product_name=product.name,
-        inventory_id=locked_item.id,
-        user_id=db_user.id,
-        telegram_id=db_user.telegram_id,
-        price=product.price,
-    )
-
-    # ── 7. Send the digital code ──────────────────────────────
-    #    The middleware will COMMIT the transaction after this
-    #    handler returns successfully.  Only then is the purchase
-    #    truly persisted.
-
-    # Get updated balance (still on the same session, pre-commit)
-    new_balance = wallet.balance - product.price  # approximation pre-commit
-
-    # Edit the original message to show purchase complete
-    await callback.message.edit_text(
-        f"🎉 <b>Purchase Successful!</b>\n\n"
-        f"<b>Product:</b>  {product.name}\n"
-        f"<b>Price:</b>    ${product.price:.2f}\n"
-        f"<b>Order:</b>    #{order.id}\n"
-    )
-
-    # Send the code in a SEPARATE message with spoiler formatting
-    # so it's hidden in chat previews and notifications
-    await callback.message.answer(
-        f"🔐 <b>Your Digital Code</b>\n\n"
-        f"<b>Product:</b> {product.name}\n"
-        f"<b>Order:</b>   #{order.id}\n\n"
-        f"<tg-spoiler>{locked_item.data}</tg-spoiler>\n\n"
-        f"<i>⚠️ Save this code! It will not be shown again.</i>\n"
-        f"<i>💰 Remaining balance: ${new_balance:.2f}</i>",
-    )
-
-    await callback.answer("✅ Purchase complete!", show_alert=False)
+# ═════════════════════════════════════════════════════════════════════════════
+#  NOTE: The [Buy] callback (ProductAction.BUY) is now handled by checkout.py.
+#  It intercepts the BUY action and presents a Pay / Promo Code gateway.
+# ═════════════════════════════════════════════════════════════════════════════
 
 
 # ═════════════════════════════════════════════════════════════

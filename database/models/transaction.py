@@ -74,7 +74,7 @@ class Transaction(Base):
     status: Mapped[TransactionStatus] = mapped_column(
         Enum(TransactionStatus, name="transaction_status", create_constraint=True),
         default=TransactionStatus.COMPLETED,
-        server_default="completed",
+        server_default="COMPLETED",
         nullable=False,
         comment="Current status of the transaction",
     )
