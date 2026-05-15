@@ -54,6 +54,7 @@ from database.repositories.product import ProductRepository
 from database.repositories.promo_code import PromoCodeRepository
 from database.repositories.user import UserRepository
 from database.repositories.wallet import WalletRepository
+from database.models.promo_order_request import PromoOrderStatus
 
 logger = structlog.get_logger()
 
@@ -453,7 +454,8 @@ async def process_promo_code(
         f"<b>Product:</b>  {product.name}\n"
         f"<b>Status:</b>   ⏳ Awaiting admin verification\n\n"
         f"You'll be notified once an admin reviews your code.\n"
-        f"This usually takes a few minutes."
+        f"This usually takes a few minutes.",
+        parse_mode="HTML",
     )
 
     # ── Build admin notification ──────────────────────────────
@@ -491,17 +493,17 @@ async def process_promo_code(
             sent = await bot.send_message(
                 admin_id,
                 admin_text,
+                parse_mode="HTML",
                 reply_markup=approve_reject_kb.as_markup(),
             )
-            # Store admin message reference so we can edit it later
-            async with async_session_factory() as session:
-                repo = PromoCodeRepository(session)
-                await repo.set_admin_message(
-                    request_id=request.id,
-                    admin_chat_id=admin_id,
-                    admin_message_id=sent.message_id,
-                )
-                await session.commit()
+            # Use the SAME injected session (promo_repo) — it can see the
+            # flushed-but-uncommitted request row within the same transaction.
+            # A separate session would NOT see it (READ COMMITTED isolation).
+            await promo_repo.set_admin_message(
+                request_id=request.id,
+                admin_chat_id=admin_id,
+                admin_message_id=sent.message_id,
+            )
         except Exception as e:
             logger.warning("Failed to notify admin about promo request", error=str(e))
 
@@ -525,16 +527,8 @@ async def handle_promo_order_decision(
 ) -> None:
     """
     Admin presses Approve or Reject on a promo-code order request.
-
-    On Approve:
-      • Lock inventory item (FOR UPDATE SKIP LOCKED)
-      • Mark item as sold + create order record
-      • Send the digital code to the user
-      • Edit the admin's notification message to show status
-
-    On Reject:
-      • Update request status to REJECTED
-      • Notify user with the original checkout keyboard
+    Wrapped in a global try/except so callback.answer() is ALWAYS called,
+    preventing the frozen spinner on any unexpected error.
     """
     if callback.from_user.id not in settings.bot.admin_ids:
         await callback.answer("🚫 You are not an admin.", show_alert=True)
@@ -542,157 +536,164 @@ async def handle_promo_order_decision(
 
     request_id = callback_data.request_id
     action = callback_data.action
+    status_text = "✅ <b>APPROVED</b>" if action == PromoOrderAction.APPROVE else "❌ <b>REJECTED</b>"
 
-    async with async_session_factory() as session:
-        async with session.begin():
-            promo_repo = PromoCodeRepository(session)
-            inventory_repo = InventoryRepository(session)
-            order_repo = OrderRepository(session)
-            user_repo = UserRepository(session)
-            product_repo = ProductRepository(session)
+    try:
+        async with async_session_factory() as session:
+            async with session.begin():
+                promo_repo = PromoCodeRepository(session)
+                inventory_repo = InventoryRepository(session)
+                order_repo = OrderRepository(session)
+                user_repo = UserRepository(session)
+                product_repo = ProductRepository(session)
 
-            request = await promo_repo.get_request(request_id)
-            if request is None:
-                await callback.answer("⚠️ Request not found.", show_alert=True)
-                return
-
-            if request.status != "PENDING":
-                await callback.answer(
-                    f"⚠️ Already {request.status.value.lower()}.", show_alert=True
-                )
-                return
-
-            product = await product_repo.get_by_id(request.product_id)
-            db_user = await user_repo.get_by_id(request.user_id)
-
-            # ── APPROVE ──────────────────────────────────────
-            if action == PromoOrderAction.APPROVE:
-                was_updated = await promo_repo.approve_request(
-                    request_id,
-                    note=f"Approved by admin {callback.from_user.id}",
-                )
-                if not was_updated:
-                    await callback.answer("⚠️ Already processed.", show_alert=True)
+                request = await promo_repo.get_request(request_id)
+                if request is None:
+                    await callback.answer("⚠️ Request not found.", show_alert=True)
                     return
 
-                # Lock and deliver inventory
-                locked_item = await inventory_repo.lock_available_item(request.product_id)
-                if locked_item is None:
-                    # Out of stock — still approved but can't deliver
+                if request.status != PromoOrderStatus.PENDING:
                     await callback.answer(
-                        "⚠️ Approved but product is OUT OF STOCK. No inventory to deliver.",
-                        show_alert=True,
+                        f"⚠️ Already {request.status.value.lower()}.", show_alert=True
                     )
-                    # Notify user
+                    return
+
+                product = await product_repo.get_by_id(request.product_id)
+                db_user = await user_repo.get_by_id(request.user_id)
+
+                # ── APPROVE ──────────────────────────────────────
+                if action == PromoOrderAction.APPROVE:
+                    was_updated = await promo_repo.approve_request(
+                        request_id,
+                        note=f"Approved by admin {callback.from_user.id}",
+                    )
+                    if not was_updated:
+                        await callback.answer("⚠️ Already processed.", show_alert=True)
+                        return
+
+                    locked_item = await inventory_repo.lock_available_item(request.product_id)
+                    if locked_item is None:
+                        if db_user:
+                            try:
+                                await bot.send_message(
+                                    db_user.telegram_id,
+                                    f"✅ <b>Promo Code Approved!</b>\n\n"
+                                    f"Product: <b>{product.name if product else 'N/A'}</b>\n\n"
+                                    f"⚠️ Unfortunately out of stock right now. "
+                                    f"You'll be notified when stock is replenished.",
+                                    parse_mode="HTML",
+                                )
+                            except Exception:
+                                pass
+                        await callback.answer(
+                            "⚠️ Approved but OUT OF STOCK — no inventory to deliver.",
+                            show_alert=True,
+                        )
+                        return
+
+                    await inventory_repo.mark_as_sold(
+                        inventory_id=locked_item.id,
+                        buyer_id=request.user_id,
+                    )
+                    order, _ = await order_repo.create_full_order(
+                        user_id=request.user_id,
+                        product_id=request.product_id,
+                        inventory_id=locked_item.id,
+                        price=0.0,
+                    )
+
+                    logger.info(
+                        "Promo order approved and fulfilled",
+                        request_id=request_id,
+                        order_id=order.id,
+                        user_id=request.user_id,
+                        admin_id=callback.from_user.id,
+                    )
+
                     if db_user:
                         try:
                             await bot.send_message(
                                 db_user.telegram_id,
                                 f"✅ <b>Promo Code Approved!</b>\n\n"
-                                f"Product: <b>{product.name if product else 'N/A'}</b>\n\n"
-                                f"⚠️ Unfortunately this product is currently out of stock. "
-                                f"You will be notified when stock is replenished."
+                                f"<b>Product:</b> {product.name if product else 'N/A'}\n"
+                                f"<b>Order:</b>   #{order.id}\n\n"
+                                f"🔐 <b>Your Digital Code:</b>\n"
+                                f"<tg-spoiler>{locked_item.data}</tg-spoiler>\n\n"
+                                f"<i>⚠️ Save this code — it will not be shown again.</i>",
+                                parse_mode="HTML",
                             )
-                        except Exception:
-                            pass
-                    return
+                        except Exception as e:
+                            logger.warning("Failed to deliver code to user", error=str(e))
 
-                await inventory_repo.mark_as_sold(
-                    inventory_id=locked_item.id,
-                    buyer_id=request.user_id,
-                )
-                order, _ = await order_repo.create_full_order(
-                    user_id=request.user_id,
-                    product_id=request.product_id,
-                    inventory_id=locked_item.id,
-                    price=0.0,  # Promo code — no charge
-                )
+                # ── REJECT ───────────────────────────────────────
+                elif action == PromoOrderAction.REJECT:
+                    was_updated = await promo_repo.reject_request(
+                        request_id,
+                        note=f"Rejected by admin {callback.from_user.id}",
+                    )
+                    if not was_updated:
+                        await callback.answer("⚠️ Already processed.", show_alert=True)
+                        return
 
-                logger.info(
-                    "Promo order approved and fulfilled",
-                    request_id=request_id,
-                    order_id=order.id,
-                    user_id=request.user_id,
-                    admin_id=callback.from_user.id,
-                )
+                    logger.info(
+                        "Promo order rejected",
+                        request_id=request_id,
+                        user_id=request.user_id,
+                        admin_id=callback.from_user.id,
+                    )
 
-                # Deliver to user
-                if db_user:
-                    try:
-                        await bot.send_message(
-                            db_user.telegram_id,
-                            f"✅ <b>Promo Code Approved!</b>\n\n"
-                            f"<b>Product:</b> {product.name if product else 'N/A'}\n"
-                            f"<b>Order:</b>   #{order.id}\n\n"
-                            f"🔐 <b>Your Digital Code:</b>\n"
-                            f"<tg-spoiler>{locked_item.data}</tg-spoiler>\n\n"
-                            f"<i>⚠️ Save this code — it will not be shown again.</i>"
-                        )
-                    except Exception as e:
-                        logger.warning("Failed to deliver code to user", error=str(e))
+                    if db_user and product:
+                        try:
+                            retry_kb = InlineKeyboardBuilder()
+                            retry_kb.row(
+                                InlineKeyboardButton(
+                                    text="💳 Pay",
+                                    callback_data=CheckoutCallback(
+                                        action=CheckoutAction.PAY,
+                                        product_id=product.id,
+                                    ).pack(),
+                                ),
+                                InlineKeyboardButton(
+                                    text="🎁 Try Another Code",
+                                    callback_data=CheckoutCallback(
+                                        action=CheckoutAction.PROMO,
+                                        product_id=product.id,
+                                    ).pack(),
+                                ),
+                            )
+                            await bot.send_message(
+                                db_user.telegram_id,
+                                f"❌ <b>Promo Code Rejected</b>\n\n"
+                                f"<b>Code:</b>    <code>{request.promo_code}</code>\n"
+                                f"<b>Product:</b> {product.name}\n\n"
+                                f"The code was invalid or has expired.\n"
+                                f"You can try a different code or pay directly:",
+                                parse_mode="HTML",
+                                reply_markup=retry_kb.as_markup(),
+                            )
+                        except Exception as e:
+                            logger.warning("Failed to notify user of promo rejection", error=str(e))
 
-            # ── REJECT ───────────────────────────────────────
-            elif action == PromoOrderAction.REJECT:
-                was_updated = await promo_repo.reject_request(
-                    request_id,
-                    note=f"Rejected by admin {callback.from_user.id}",
-                )
-                if not was_updated:
-                    await callback.answer("⚠️ Already processed.", show_alert=True)
-                    return
+        # ── Edit admin message to show outcome ────────────────
+        try:
+            await callback.message.edit_text(
+                f"{callback.message.html_text}\n\n"
+                f"─────────────────────\n"
+                f"{status_text} by <code>{callback.from_user.id}</code>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
-                logger.info(
-                    "Promo order rejected",
-                    request_id=request_id,
-                    user_id=request.user_id,
-                    admin_id=callback.from_user.id,
-                )
-
-                # Notify user + re-show checkout buttons
-                if db_user and product:
-                    try:
-                        retry_kb = InlineKeyboardBuilder()
-                        retry_kb.row(
-                            InlineKeyboardButton(
-                                text="💳 Pay",
-                                callback_data=CheckoutCallback(
-                                    action=CheckoutAction.PAY,
-                                    product_id=product.id,
-                                ).pack(),
-                            ),
-                            InlineKeyboardButton(
-                                text="🎁 Try Another Code",
-                                callback_data=CheckoutCallback(
-                                    action=CheckoutAction.PROMO,
-                                    product_id=product.id,
-                                ).pack(),
-                            ),
-                        )
-                        await bot.send_message(
-                            db_user.telegram_id,
-                            f"❌ <b>Promo Code Rejected</b>\n\n"
-                            f"<b>Code:</b>    <code>{request.promo_code}</code>\n"
-                            f"<b>Product:</b> {product.name}\n\n"
-                            f"The code was invalid or has expired.\n"
-                            f"You can try a different code or pay directly:",
-                            reply_markup=retry_kb.as_markup(),
-                        )
-                    except Exception as e:
-                        logger.warning("Failed to notify user of promo rejection", error=str(e))
-
-    # ── Edit admin message to show outcome ────────────────────
-    status_text = (
-        "✅ <b>APPROVED</b>" if action == PromoOrderAction.APPROVE else "❌ <b>REJECTED</b>"
-    )
-    try:
-        await callback.message.edit_text(
-            f"{callback.message.text}\n\n"
-            f"─────────────────────\n"
-            f"{status_text} by <code>{callback.from_user.id}</code>"
+        await callback.answer(
+            "Approved ✅" if action == PromoOrderAction.APPROVE else "Rejected ❌"
         )
-    except Exception:
-        pass
 
-    await callback.answer(
-        "Approved ✅" if action == PromoOrderAction.APPROVE else "Rejected ❌"
-    )
+    except Exception as e:
+        logger.error("Promo order decision failed", error=str(e), request_id=request_id)
+        try:
+            await callback.answer(
+                f"❌ Error processing request: {e}", show_alert=True
+            )
+        except Exception:
+            pass
