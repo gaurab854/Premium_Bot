@@ -62,7 +62,13 @@ async def cmd_addproduct(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.message(AddProductForm.waiting_for_name, F.text)
+@router.message(AddProductForm.waiting_for_name, Command("cancel"))
+async def cancel_addproduct(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("❌ Cancelled. Product was not added.")
+
+
+@router.message(AddProductForm.waiting_for_name, F.text & ~F.text.startswith("/"))
 async def process_product_name(message: Message, state: FSMContext) -> None:
     name = message.text.strip()
     if len(name) < 2:
@@ -81,7 +87,7 @@ async def process_product_name(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.message(AddProductForm.waiting_for_price, F.text)
+@router.message(AddProductForm.waiting_for_price, F.text & ~F.text.startswith("/"))
 async def process_product_price(message: Message, state: FSMContext) -> None:
     raw = message.text.strip()
     try:
@@ -104,7 +110,7 @@ async def process_product_price(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.message(AddProductForm.waiting_for_category, F.text)
+@router.message(AddProductForm.waiting_for_category, F.text & ~F.text.startswith("/"))
 async def process_product_category(message: Message, state: FSMContext) -> None:
     raw = message.text.strip()
     category = None if raw == "-" else raw[:128]
@@ -120,7 +126,7 @@ async def process_product_category(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.message(AddProductForm.waiting_for_description, F.text)
+@router.message(AddProductForm.waiting_for_description, F.text & ~F.text.startswith("/"))
 async def process_product_description(message: Message, state: FSMContext) -> None:
     raw = message.text.strip()
     description = None if raw == "-" else raw
@@ -138,7 +144,7 @@ async def process_product_description(message: Message, state: FSMContext) -> No
     )
 
 
-@router.message(AddProductForm.waiting_for_codes, F.text)
+@router.message(AddProductForm.waiting_for_codes, F.text & ~F.text.startswith("/"))
 async def process_product_codes(
     message: Message,
     state: FSMContext,
@@ -304,7 +310,13 @@ async def cmd_addstock(
     )
 
 
-@router.message(AddStockForm.waiting_for_codes, F.text)
+@router.message(AddStockForm.waiting_for_codes, Command("cancel"))
+async def cancel_addstock(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("❌ Cancelled. Stock was not added.")
+
+
+@router.message(AddStockForm.waiting_for_codes, F.text & ~F.text.startswith("/"))
 async def process_addstock_codes(
     message: Message,
     state: FSMContext,
@@ -616,7 +628,13 @@ async def cmd_addpromo(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.message(AddPromoForm.waiting_for_code, F.text)
+@router.message(AddPromoForm.waiting_for_code, Command("cancel"))
+async def cancel_addpromo(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("❌ Cancelled. Promo code was not created.")
+
+
+@router.message(AddPromoForm.waiting_for_code, F.text & ~F.text.startswith("/"))
 async def process_promo_code_name(message: Message, state: FSMContext) -> None:
     code = message.text.strip().upper()
     if len(code) < 2 or len(code) > 128:
@@ -632,7 +650,7 @@ async def process_promo_code_name(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.message(AddPromoForm.waiting_for_description, F.text)
+@router.message(AddPromoForm.waiting_for_description, F.text & ~F.text.startswith("/"))
 async def process_promo_description(message: Message, state: FSMContext) -> None:
     raw = message.text.strip()
     description = None if raw == "-" else raw
@@ -644,7 +662,7 @@ async def process_promo_description(message: Message, state: FSMContext) -> None
     )
 
 
-@router.message(AddPromoForm.waiting_for_max_uses, F.text)
+@router.message(AddPromoForm.waiting_for_max_uses, F.text & ~F.text.startswith("/"))
 async def process_promo_max_uses(message: Message, state: FSMContext) -> None:
     raw = message.text.strip()
     try:
@@ -665,7 +683,7 @@ async def process_promo_max_uses(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.message(AddPromoForm.waiting_for_product_id, F.text)
+@router.message(AddPromoForm.waiting_for_product_id, F.text & ~F.text.startswith("/"))
 async def process_promo_product_id(
     message: Message,
     state: FSMContext,

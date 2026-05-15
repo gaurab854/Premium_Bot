@@ -387,7 +387,14 @@ async def on_checkout_promo(
     await callback.answer()
 
 
-@router.message(CheckoutForm.waiting_for_promo_code, F.text)
+@router.message(CheckoutForm.waiting_for_promo_code, Command("cancel"))
+async def cancel_promo_entry_cmd(message: Message, state: FSMContext) -> None:
+    """Cancel the promo code entry via /cancel command."""
+    await state.clear()
+    await message.answer("❌ Cancelled. Use /shop to browse products.")
+
+
+@router.message(CheckoutForm.waiting_for_promo_code, F.text & ~F.text.startswith("/"))
 async def process_promo_code(
     message: Message,
     state: FSMContext,

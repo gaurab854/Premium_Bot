@@ -103,7 +103,7 @@ async def cmd_start(
     # ── Welcome message ───────────────────────────────────────
     builder = InlineKeyboardBuilder()
     builder.row(
-        InlineKeyboardButton(text="🏪 Browse Shop", callback_data="open_shop"),
+        InlineKeyboardButton(text="🎁 Browse Products", callback_data="open_shop"),
         InlineKeyboardButton(text="💰 My Balance", callback_data="my_balance"),
     )
     builder.row(
@@ -158,7 +158,7 @@ async def check_membership_callback(
 
     builder = InlineKeyboardBuilder()
     builder.row(
-        InlineKeyboardButton(text="🏪 Browse Shop", callback_data="open_shop"),
+        InlineKeyboardButton(text="🎁 Browse Products", callback_data="open_shop"),
         InlineKeyboardButton(text="💰 My Balance", callback_data="my_balance"),
     )
     builder.row(
