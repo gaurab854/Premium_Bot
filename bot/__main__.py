@@ -85,6 +85,19 @@ async def on_startup(bot: Bot) -> None:
                 admin_id,
                 f"🟢 <b>Bot started successfully!</b>\n"
                 f"Mode: {mode}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    # Announce to channel that server is back online
+    if settings.bot.channel_id:
+        try:
+            await bot.send_message(
+                settings.bot.channel_id,
+                "✅ <b>Server is back online!</b>\n\n"
+                "🛡️ All services are operational. You can now browse and purchase products normally.",
+                parse_mode="HTML",
             )
         except Exception:
             pass
@@ -93,6 +106,18 @@ async def on_startup(bot: Bot) -> None:
 async def on_shutdown(bot: Bot) -> None:
     """Cleanup on graceful shutdown."""
     structlog.get_logger().info("Bot shutting down …")
+
+    # Announce to channel that server is under maintenance
+    if settings.bot.channel_id:
+        try:
+            await bot.send_message(
+                settings.bot.channel_id,
+                "🔧 <b>Server is under maintenance.</b>\n\n"
+                "⏳ The bot will be temporarily unavailable. We'll be back shortly!",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
     # Remove webhook on shutdown
     if settings.webhook.enabled:
