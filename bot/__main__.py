@@ -193,29 +193,26 @@ def _build_dispatcher(storage: RedisStorage) -> Dispatcher:
     )
 
     # ── Global Error Handler ──────────────────────────────────
+    from aiogram.types import ErrorEvent
+    
     @dp.error()
-    async def global_error_handler(event: TelegramObject, exception: Exception) -> None:
+    async def global_error_handler(event: ErrorEvent, bot: Bot) -> None:
         """Log errors and notify admins."""
         structlog.get_logger().error(
             "Unhandled exception",
-            error=str(exception),
-            event_type=type(event).__name__,
+            error=str(event.exception),
+            event_type=type(event.update).__name__,
             exc_info=True,
         )
         
         # Notify admins if possible
         for admin_id in settings.bot.admin_ids:
             try:
-                # Use the bot from context if available
-                bot = getattr(event, "bot", None)
-                if not bot:
-                    continue
-                    
                 await bot.send_message(
                     admin_id,
                     f"🚨 <b>Unhandled Error</b>\n\n"
-                    f"<b>Type:</b> <code>{type(exception).__name__}</code>\n"
-                    f"<b>Message:</b> <code>{str(exception)}</code>\n\n"
+                    f"<b>Type:</b> <code>{type(event.exception).__name__}</code>\n"
+                    f"<b>Message:</b> <code>{str(event.exception)}</code>\n\n"
                     f"Check server logs for traceback."
                 )
             except Exception:
