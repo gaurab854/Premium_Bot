@@ -45,6 +45,25 @@ router = Router(name="admin")
 router.message.filter(AdminFilter())
 
 
+async def broadcast_announcement(bot: Bot, user_repo: UserRepository, text: str) -> int:
+    """Broadcast a text message to all active users in chunks."""
+    offset = 0
+    limit = 100
+    sent_count = 0
+    while True:
+        users = await user_repo.get_all_active(limit=limit, offset=offset)
+        if not users:
+            break
+        for u in users:
+            try:
+                await bot.send_message(u.telegram_id, text)
+                sent_count += 1
+            except Exception:
+                pass
+        offset += limit
+    return sent_count
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  /addproduct — FSM flow to add a new product
 # ═════════════════════════════════════════════════════════════════════════════
@@ -149,6 +168,7 @@ async def process_product_codes(
     bot: Bot,
     product_repo: ProductRepository,
     inventory_repo: InventoryRepository,
+    user_repo: UserRepository,
 ) -> None:
     """Save the product and its initial inventory, then announce to channel."""
     raw = message.text.strip()
@@ -190,22 +210,22 @@ async def process_product_codes(
         f"📢 Sending announcement to the channel..."
     )
 
-    # ── Announce to channel ───────────────────────────────────
+    # ── Announce to channel & users ───────────────────────────
+    desc_text = f"\n📄 {product.description}\n" if product.description else ""
+    cat_text = f"🏷️ <b>Category:</b> {product.category}\n" if product.category else ""
+    announcement_text = (
+        f"🆕 <b>New Product Available!</b>\n\n"
+        f"🛍️ <b>{product.name}</b>\n"
+        f"{desc_text}"
+        f"\n{cat_text}"
+        f"💰 <b>Price:</b> ${product.price:.2f}\n"
+        f"📦 <b>In Stock:</b> {count} unit(s)\n\n"
+        f"👉 Use /shop in the bot to purchase!"
+    )
+
     if settings.bot.channel_id:
         try:
-            desc_text = f"\n📄 {product.description}\n" if product.description else ""
-            cat_text = f"🏷️ <b>Category:</b> {product.category}\n" if product.category else ""
-
-            await bot.send_message(
-                settings.bot.channel_id,
-                f"🆕 <b>New Product Available!</b>\n\n"
-                f"🛍️ <b>{product.name}</b>\n"
-                f"{desc_text}"
-                f"\n{cat_text}"
-                f"💰 <b>Price:</b> ${product.price:.2f}\n"
-                f"📦 <b>In Stock:</b> {count} unit(s)\n\n"
-                f"👉 Use /shop in the bot to purchase!",
-            )
+            await bot.send_message(settings.bot.channel_id, announcement_text)
             await message.answer("✅ Channel announcement sent!")
         except Exception as e:
             logger.warning("Failed to send channel announcement", error=str(e))
@@ -218,6 +238,10 @@ async def process_product_codes(
             "ℹ️ No channel configured. Set <code>BOT_CHANNEL_ID</code> in your .env "
             "to enable channel announcements."
         )
+
+    await message.answer("📢 Broadcasting announcement to all users. This might take a moment...")
+    sent = await broadcast_announcement(bot, user_repo, announcement_text)
+    await message.answer(f"✅ Announcement sent to {sent} user(s)!")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -319,6 +343,7 @@ async def process_addstock_codes(
     bot: Bot,
     inventory_repo: InventoryRepository,
     product_repo: ProductRepository,
+    user_repo: UserRepository,
 ) -> None:
     """Receive codes for /addstock and bulk-insert into inventory."""
     raw = message.text.strip()
@@ -355,16 +380,17 @@ async def process_addstock_codes(
         f"📢 Sending announcement to the channel..."
     )
 
-    # ── Announce stock restock to channel ────────────────────
+    # ── Announce stock restock to channel & users ────────────
+    announcement_text = (
+        f"🔄 <b>Stock Restocked!</b>\n\n"
+        f"🛍️ <b>{product.name}</b>\n"
+        f"📦 <b>Available now:</b> {new_stock} unit(s)\n\n"
+        f"👉 Use /shop in the bot to purchase!"
+    )
+
     if settings.bot.channel_id:
         try:
-            await bot.send_message(
-                settings.bot.channel_id,
-                f"🔄 <b>Stock Restocked!</b>\n\n"
-                f"🛍️ <b>{product.name}</b>\n"
-                f"📦 <b>Available now:</b> {new_stock} unit(s)\n\n"
-                f"👉 Use /shop in the bot to purchase!",
-            )
+            await bot.send_message(settings.bot.channel_id, announcement_text)
             await message.answer("✅ Channel announcement sent!")
         except Exception as e:
             logger.warning("Failed to send stock announcement", error=str(e))
@@ -377,6 +403,10 @@ async def process_addstock_codes(
             "ℹ️ No channel configured. Set <code>BOT_CHANNEL_ID</code> in your .env "
             "to enable channel announcements."
         )
+
+    await message.answer("📢 Broadcasting restock announcement to all users. This might take a moment...")
+    sent = await broadcast_announcement(bot, user_repo, announcement_text)
+    await message.answer(f"✅ Restock announcement sent to {sent} user(s)!")
 
 
 
