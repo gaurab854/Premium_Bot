@@ -221,13 +221,14 @@ class ProductRepository:
         await self._session.delete(product)
         await self._session.flush()
 
-        # 3. Reset sequence to fill ID gaps — next product reuses the lowest free ID
+        # 4. Reset sequence to fill ID gaps — next product reuses the lowest free ID
         await self._session.execute(
             text(
                 """
                 SELECT setval(
                     pg_get_serial_sequence('products', 'id'),
-                    COALESCE((SELECT MAX(id) FROM products), 0)
+                    COALESCE((SELECT MAX(id) FROM products), 1),
+                    (SELECT MAX(id) FROM products) IS NOT NULL
                 )
                 """
             )
