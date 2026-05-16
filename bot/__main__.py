@@ -132,7 +132,7 @@ async def on_shutdown(bot: Bot) -> None:
     """Cleanup on graceful shutdown."""
     structlog.get_logger().info("Bot shutting down …")
 
-    # Announce to channel that server is under maintenance
+    # Announce to channel FIRST (before anything else closes)
     if settings.bot.channel_id:
         try:
             await bot.send_message(
@@ -144,13 +144,6 @@ async def on_shutdown(bot: Bot) -> None:
         except Exception:
             pass
 
-    # Remove webhook on shutdown
-    if settings.webhook.enabled:
-        await bot.delete_webhook(drop_pending_updates=True)
-        structlog.get_logger().info("Webhook removed")
-
-    await async_engine.dispose()
-
     # Notify admins
     for admin_id in settings.bot.admin_ids:
         try:
@@ -160,6 +153,13 @@ async def on_shutdown(bot: Bot) -> None:
             )
         except Exception:
             pass
+
+    # Remove webhook on shutdown
+    if settings.webhook.enabled:
+        await bot.delete_webhook(drop_pending_updates=True)
+        structlog.get_logger().info("Webhook removed")
+
+    await async_engine.dispose()
 
 
 # ══════════════════════════════════════════════════════════════
