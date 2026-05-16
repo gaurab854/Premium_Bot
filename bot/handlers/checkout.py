@@ -162,13 +162,24 @@ async def on_buy_clicked(
 
     # ── Not enough balance → show how to deposit ─────────────
     builder = InlineKeyboardBuilder()
-    for key, info in PAYMENT_INFO.items():
-        builder.row(
-            InlineKeyboardButton(
-                text=info["label"],
-                callback_data=f"checkout_pay_method:{product.id}:{key}",
-            )
+    builder.row(
+        InlineKeyboardButton(
+            text="📥 Deposit via Bybit UID",
+            callback_data=f"checkout_pay_method:{product.id}:bybit",
         )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="📥 Deposit via BEP-20 (USDT)",
+            callback_data=f"checkout_pay_method:{product.id}:bep20",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="📥 Deposit via Plasma (USDT)",
+            callback_data=f"checkout_pay_method:{product.id}:plasma",
+        )
+    )
     builder.row(
         InlineKeyboardButton(
             text="🔙 Back to Shop",
@@ -178,19 +189,22 @@ async def on_buy_clicked(
 
     shortage = product.price - wallet.balance
     await callback.message.edit_text(
-        f"💳 <b>Top Up Your Balance</b>\n\n"
+        f"💳 <b>Insufficient Balance</b>\n\n"
         f"<b>Product price:</b>  ${product.price:.2f}\n"
         f"<b>Your balance:</b>   ${wallet.balance:.2f}\n"
         f"<b>You need:</b>       ${shortage:.2f} more\n\n"
-        f"Choose a payment method to top up, then use /deposit to submit your TXID:",
+        f"👇 Tap a payment method below to deposit funds.\n"
+        f"You'll be guided through the process step by step.",
         reply_markup=builder.as_markup(),
     )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("checkout_pay_method:"))
-async def on_pay_method_info(callback: CallbackQuery) -> None:
-    """Show the payment address/UID for the selected method."""
+async def on_pay_method_info(callback: CallbackQuery, state: FSMContext) -> None:
+    """Show the payment address/UID for the selected method and start deposit FSM."""
+    from bot.states.user import DepositForm
+
     parts = callback.data.split(":")
     # Format: checkout_pay_method:<product_id>:<method_key>
     product_id = int(parts[1])
@@ -201,6 +215,10 @@ async def on_pay_method_info(callback: CallbackQuery) -> None:
         await callback.answer("Unknown method.", show_alert=True)
         return
 
+    # Start the deposit FSM so the user can paste their TXID immediately
+    await state.set_state(DepositForm.waiting_for_amount)
+    await state.update_data(payment_method=method_key)
+
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text="🔙 Back", callback_data=f"back_checkout:{product_id}"),
@@ -210,8 +228,10 @@ async def on_pay_method_info(callback: CallbackQuery) -> None:
         f"{info['label']}\n\n"
         f"<b>Send to:</b>\n<code>{info['value']}</code>\n\n"
         f"ℹ️ {info['note']}\n\n"
-        f"After sending funds, use /deposit to submit your transaction ID.\n"
-        f"Once approved, come back to /shop to purchase.",
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>How much are you depositing? (in USD)</b>\n\n"
+        f"<i>Reply with the amount, e.g. 25.00</i>\n"
+        f"<i>Then you'll be asked for your Transaction Hash.</i>",
         reply_markup=builder.as_markup(),
     )
     await callback.answer()
