@@ -30,13 +30,12 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.callbacks.deposit import DepositAction, DepositCallback
 from bot.filters.admin import AdminFilter
-from bot.states.user import AddProductForm, AddPromoForm, AddStockForm
+from bot.states.user import AddProductForm, AddStockForm
 from config import settings
 from database import async_session_factory
 from database.repositories.deposit import DepositRepository
 from database.repositories.inventory import InventoryRepository
 from database.repositories.product import ProductRepository
-from database.repositories.promo_code import PromoCodeRepository
 from database.repositories.user import UserRepository
 from database.repositories.wallet import WalletRepository
 
