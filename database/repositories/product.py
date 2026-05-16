@@ -197,23 +197,27 @@ class ProductRepository:
         """
         from sqlalchemy import delete, text
         from database.models.inventory import Inventory
+        from database.models.order_item import OrderItem
 
         product = await self._session.get(Product, product_id)
         if product is None:
             return False
 
-        # 1. Delete unsold inventory for this product
-        # (Sold inventory will cause a CASCADE delete if not restricted, 
-        # but OrderItem RESTRICTs product deletion if it has orders)
+        # 1. Delete all order items associated with this product
         await self._session.execute(
-            delete(Inventory).where(
-                Inventory.product_id == product_id,
-                Inventory.is_sold.is_(False),
+            delete(OrderItem).where(
+                OrderItem.product_id == product_id
             )
         )
 
-        # 2. Hard-delete the product row
-        # This will fail if OrderItems exist due to RESTRICT
+        # 2. Delete all inventory associated with this product (both sold and unsold)
+        await self._session.execute(
+            delete(Inventory).where(
+                Inventory.product_id == product_id
+            )
+        )
+
+        # 3. Hard-delete the product row
         await self._session.delete(product)
         await self._session.flush()
 
