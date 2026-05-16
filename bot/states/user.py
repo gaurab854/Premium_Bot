@@ -41,6 +41,7 @@ class AddProductForm(StatesGroup):
     waiting_for_price = State()
     waiting_for_category = State()
     waiting_for_description = State()
+    waiting_for_allow_promo = State()
     waiting_for_codes = State()
 
 
@@ -77,4 +78,5 @@ class AddStockForm(StatesGroup):
     Admin add-stock FSM.
     Steps: /addstock <id> → waiting_for_codes (admin sends codes one per line)
     """
+    waiting_for_allow_promo = State()
     waiting_for_codes = State()

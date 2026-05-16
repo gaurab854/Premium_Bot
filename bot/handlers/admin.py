@@ -132,12 +132,29 @@ async def process_product_description(message: Message, state: FSMContext) -> No
     description = None if raw == "-" else raw
 
     await state.update_data(product_description=description)
-    await state.set_state(AddProductForm.waiting_for_codes)
+    await state.set_state(AddProductForm.waiting_for_allow_promo)
 
-    fsm_data = await state.get_data()
     await message.answer(
         f"✅ Description saved.\n\n"
-        "<b>Step 5/5</b> — Now enter the <b>inventory codes</b> (the digital goods).\n\n"
+        "<b>Step 5/6</b> — Do you want to allow <b>promo codes</b> for this product?\n\n"
+        "Reply <code>yes</code> to allow promo codes, or <code>no</code> to disable them."
+    )
+
+
+@router.message(AddProductForm.waiting_for_allow_promo, F.text & ~F.text.startswith("/"))
+async def process_product_allow_promo(message: Message, state: FSMContext) -> None:
+    raw = message.text.strip().lower()
+    if raw not in ("yes", "no", "y", "n"):
+        await message.answer("⚠️ Please answer with <code>yes</code> or <code>no</code>.")
+        return
+        
+    allow_promo = raw in ("yes", "y")
+    await state.update_data(product_allow_promo=allow_promo)
+    await state.set_state(AddProductForm.waiting_for_codes)
+
+    await message.answer(
+        f"✅ Promo codes allowed: <b>{'Yes' if allow_promo else 'No'}</b>\n\n"
+        "<b>Step 6/6</b> — Now enter the <b>inventory codes</b> (the digital goods).\n\n"
         "📋 Send <b>one code per line</b>:\n"
         "<code>CODE1234\nCODE5678\nCODE9012</code>\n\n"
         "<i>Each line = one unit of stock. You can add more later with /addstock.</i>"
@@ -169,6 +186,7 @@ async def process_product_codes(
         price=fsm_data["product_price"],
         description=fsm_data.get("product_description"),
         category=fsm_data.get("product_category"),
+        allow_promo=fsm_data.get("product_allow_promo", False),
     )
 
     # ── Bulk-add inventory ────────────────────────────────────
@@ -230,24 +248,22 @@ async def process_product_codes(
 async def cmd_products(
     message: Message,
     product_repo: ProductRepository,
-    inventory_repo: InventoryRepository,
 ) -> None:
     """List all products with their current stock counts."""
-    products = await product_repo.get_available(limit=50)
+    # Use optimized single query to get products + counts
+    results = await product_repo.get_all_with_counts(limit=50)
 
-    if not products:
+    if not results:
         await message.answer("🏪 No products in the catalogue yet.\nUse /addproduct to add one.")
         return
 
     lines = ["📦 <b>Product Catalogue (Admin View)</b>\n"]
-    for p in products:
-        stock = await inventory_repo.count_available(p.id)
-        sold = await inventory_repo.count_sold(p.id)
-        status = "✅" if p.is_available else "🚫"
+    for product, stock, sold in results:
+        status = "✅" if product.is_available else "🚫"
         lines.append(
-            f"{status} <b>#{p.id} — {p.name}</b>\n"
-            f"   💰 ${p.price:.2f}  |  📦 {stock} in stock  |  ✅ {sold} sold\n"
-            f"   🏷️ {p.category or 'No category'}\n"
+            f"{status} <b>#{product.id} — {product.name}</b>\n"
+            f"   💰 ${product.price:.2f}  |  📦 {stock} in stock  |  ✅ {sold} sold\n"
+            f"   🏷️ {product.category or 'No category'}\n"
         )
 
     lines.append(
@@ -297,13 +313,37 @@ async def cmd_addstock(
 
     stock = await inventory_repo.count_available(product_id)
 
-    # ── Set FSM state so the next message is captured as codes ──
-    await state.set_state(AddStockForm.waiting_for_codes)
+    # ── Set FSM state so the next message is captured as allow_promo ──
+    await state.set_state(AddStockForm.waiting_for_allow_promo)
     await state.update_data(addstock_product_id=product_id)
 
+    promo_status = "Enabled" if product.allow_promo else "Disabled"
     await message.answer(
         f"📦 <b>Adding stock to: {product.name}</b>\n"
-        f"Current stock: {stock} unit(s)\n\n"
+        f"Current stock: {stock} unit(s)\n"
+        f"Promo codes: {promo_status}\n\n"
+        f"Do you want to allow promo codes for this product? "
+        f"Reply <code>yes</code> to allow, <code>no</code> to disable, or <code>skip</code> to keep current setting.\n\n"
+        f"Send /cancel to abort."
+    )
+
+@router.message(AddStockForm.waiting_for_allow_promo, F.text & ~F.text.startswith("/"))
+async def process_addstock_allow_promo(message: Message, state: FSMContext, product_repo: ProductRepository) -> None:
+    raw = message.text.strip().lower()
+    fsm_data = await state.get_data()
+    product_id = fsm_data.get("addstock_product_id")
+    
+    if raw not in ("yes", "no", "y", "n", "skip"):
+        await message.answer("⚠️ Please answer with <code>yes</code>, <code>no</code>, or <code>skip</code>.")
+        return
+        
+    if raw != "skip":
+        allow_promo = raw in ("yes", "y")
+        await product_repo.set_allow_promo(product_id, allow_promo=allow_promo)
+        await message.answer(f"✅ Promo code setting updated to: <b>{'Yes' if allow_promo else 'No'}</b>")
+
+    await state.set_state(AddStockForm.waiting_for_codes)
+    await message.answer(
         f"Now send the codes, <b>one per line</b>:\n"
         f"<code>CODE1\nCODE2\nCODE3</code>\n\n"
         f"Send /cancel to abort."
@@ -392,12 +432,8 @@ async def cmd_delproduct(
     """
     Permanently delete a product from the database.
     Usage: /delproduct <product_id>
-
-    - Removes the product row completely
-    - Deletes all unsold inventory codes for that product
-    - Resets the ID sequence so the next product reuses freed IDs
-    - Sold inventory is kept for order history
     """
+
     args = message.text.split(maxsplit=1)
     if len(args) < 2 or not args[1].strip().isdigit():
         await message.answer("⚠️ Usage: <code>/delproduct &lt;product_id&gt;</code>")
@@ -409,19 +445,60 @@ async def cmd_delproduct(
         await message.answer(f"⚠️ Product #{product_id} not found.")
         return
 
-    product_name = product.name  # save before deletion
+    product_name = product.name
 
-    deleted = await product_repo.hard_delete(product_id)
-    if deleted:
-        await message.answer(
-            f"🗑️ <b>Product Permanently Deleted</b>\n\n"
-            f"<b>ID:</b>    #{product_id}\n"
-            f"<b>Name:</b>  {product_name}\n\n"
-            f"✅ All unsold inventory codes removed.\n"
-            f"♻️ ID #{product_id} will be reused for the next product."
-        )
-    else:
-        await message.answer(f"⚠️ Failed to delete product #{product_id}.")
+    try:
+        deleted = await product_repo.hard_delete(product_id)
+        if deleted:
+            await message.answer(
+                f"🗑️ <b>Product Permanently Deleted</b>\n\n"
+                f"<b>ID:</b>    #{product_id}\n"
+                f"<b>Name:</b>  {product_name}\n\n"
+                f"✅ All unsold inventory codes removed.\n"
+                f"✅ Sales history (order items) for this product cleared.\n"
+                f"♻️ ID #{product_id} will be reused for the next product."
+            )
+        else:
+            await message.answer(f"⚠️ Failed to delete product #{product_id}.")
+    except Exception as e:
+        logger.error("Error deleting product", product_id=product_id, error=str(e))
+        await message.answer(f"⚠️ An error occurred while deleting product #{product_id}.")
+
+
+@router.message(Command("hideproduct"))
+async def cmd_hideproduct(message: Message, product_repo: ProductRepository) -> None:
+    """Hide a product from the catalogue."""
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip().isdigit():
+        await message.answer("⚠️ Usage: <code>/hideproduct &lt;product_id&gt;</code>")
+        return
+
+    product_id = int(args[1].strip())
+    product = await product_repo.get_by_id(product_id)
+    if not product:
+        await message.answer(f"⚠️ Product #{product_id} not found.")
+        return
+
+    await product_repo.set_available(product_id, available=False)
+    await message.answer(f"🚫 Product <b>{product.name}</b> (#<code>{product_id}</code>) is now <b>HIDDEN</b> from the catalogue.")
+
+
+@router.message(Command("showproduct"))
+async def cmd_showproduct(message: Message, product_repo: ProductRepository) -> None:
+    """Show a product in the catalogue."""
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip().isdigit():
+        await message.answer("⚠️ Usage: <code>/showproduct &lt;product_id&gt;</code>")
+        return
+
+    product_id = int(args[1].strip())
+    product = await product_repo.get_by_id(product_id)
+    if not product:
+        await message.answer(f"⚠️ Product #{product_id} not found.")
+        return
+
+    await product_repo.set_available(product_id, available=True)
+    await message.answer(f"✅ Product <b>{product.name}</b> (#<code>{product_id}</code>) is now <b>VISIBLE</b> in the catalogue.")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -604,6 +681,7 @@ async def handle_deposit_decision(
         )
 
     await callback.answer(f"Deposit {action.value}d.", show_alert=False)
+
 
     # ── Notify the user ───────────────────────────────────────
     try:

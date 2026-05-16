@@ -31,6 +31,7 @@ class ProductRepository:
         price: float,
         description: Optional[str] = None,
         category: Optional[str] = None,
+        allow_promo: bool = False,
     ) -> Product:
         """Add a new product to the catalogue."""
         product = Product(
@@ -39,6 +40,7 @@ class ProductRepository:
             description=description,
             category=category,
             is_available=True,
+            allow_promo=allow_promo,
         )
         self._session.add(product)
         await self._session.flush()
@@ -99,6 +101,41 @@ class ProductRepository:
         result = await self._session.execute(stmt)
         return result.scalar_one()
 
+    async def get_all_with_counts(self, limit: int = 50) -> Sequence[tuple[Product, int, int]]:
+        """
+        Return products with their available and sold stock counts in a single query.
+        Returns a list of (Product, available_count, sold_count).
+        """
+        # Subquery for available stock
+        available_sub = (
+            select(Inventory.product_id, func.count(Inventory.id).label("count"))
+            .where(Inventory.is_sold.is_(False))
+            .group_by(Inventory.product_id)
+            .subquery()
+        )
+        # Subquery for sold stock
+        sold_sub = (
+            select(Inventory.product_id, func.count(Inventory.id).label("count"))
+            .where(Inventory.is_sold.is_(True))
+            .group_by(Inventory.product_id)
+            .subquery()
+        )
+
+        stmt = (
+            select(
+                Product,
+                func.coalesce(available_sub.c.count, 0),
+                func.coalesce(sold_sub.c.count, 0),
+            )
+            .outerjoin(available_sub, Product.id == available_sub.c.product_id)
+            .outerjoin(sold_sub, Product.id == sold_sub.c.product_id)
+            .order_by(Product.id.desc())
+            .limit(limit)
+        )
+
+        result = await self._session.execute(stmt)
+        return result.all()
+
     # ─────────────────────────────────────────────────────────
     #  UPDATE
     # ─────────────────────────────────────────────────────────
@@ -129,6 +166,20 @@ class ProductRepository:
         )
         await self._session.execute(stmt)
 
+    async def set_allow_promo(
+        self,
+        product_id: int,
+        *,
+        allow_promo: bool,
+    ) -> None:
+        """Enable or disable promo codes for a product."""
+        stmt = (
+            update(Product)
+            .where(Product.id == product_id)
+            .values(allow_promo=allow_promo)
+        )
+        await self._session.execute(stmt)
+
     # ─────────────────────────────────────────────────────────
     #  DELETE
     # ─────────────────────────────────────────────────────────
@@ -140,7 +191,9 @@ class ProductRepository:
         After deletion the PostgreSQL sequence is reset to the lowest
         available gap so new products reuse freed IDs.
 
-        Returns True if the product existed and was deleted, False if not found.
+        Returns True if the product existed and was deleted.
+        Raises sqlalchemy.exc.IntegrityError if the product cannot be deleted
+        due to existing orders (RESTRICT constraint).
         """
         from sqlalchemy import delete, text
         from database.models.inventory import Inventory
@@ -149,7 +202,9 @@ class ProductRepository:
         if product is None:
             return False
 
-        # Delete unsold inventory for this product
+        # 1. Delete unsold inventory for this product
+        # (Sold inventory will cause a CASCADE delete if not restricted, 
+        # but OrderItem RESTRICTs product deletion if it has orders)
         await self._session.execute(
             delete(Inventory).where(
                 Inventory.product_id == product_id,
@@ -157,11 +212,12 @@ class ProductRepository:
             )
         )
 
-        # Hard-delete the product row
+        # 2. Hard-delete the product row
+        # This will fail if OrderItems exist due to RESTRICT
         await self._session.delete(product)
         await self._session.flush()
 
-        # Reset sequence to fill ID gaps — next product reuses the lowest free ID
+        # 3. Reset sequence to fill ID gaps — next product reuses the lowest free ID
         await self._session.execute(
             text(
                 """

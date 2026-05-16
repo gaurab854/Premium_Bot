@@ -80,25 +80,29 @@ PAYMENT_INFO = {
 }
 
 
-def _checkout_keyboard(product_id: int):
+def _checkout_keyboard(product_id: int, allow_promo: bool = False):
     """The initial checkout choice keyboard shown to the user."""
     builder = InlineKeyboardBuilder()
-    builder.row(
+    row = [
         InlineKeyboardButton(
             text="💳 Pay",
             callback_data=CheckoutCallback(
                 action=CheckoutAction.PAY,
                 product_id=product_id,
             ).pack(),
-        ),
-        InlineKeyboardButton(
-            text="🎁 Use Promo Code",
-            callback_data=CheckoutCallback(
-                action=CheckoutAction.PROMO,
-                product_id=product_id,
-            ).pack(),
-        ),
-    )
+        )
+    ]
+    if allow_promo:
+        row.append(
+            InlineKeyboardButton(
+                text="🎁 Use Promo Code",
+                callback_data=CheckoutCallback(
+                    action=CheckoutAction.PROMO,
+                    product_id=product_id,
+                ).pack(),
+            )
+        )
+    builder.row(*row)
     builder.row(
         InlineKeyboardButton(
             text="🔙 Back to Shop",
@@ -171,7 +175,7 @@ async def on_checkout_entry(
         f"<b>Stock:</b>    {stock} unit(s)\n"
         f"<b>Balance:</b>  ${balance:.2f}\n\n"
         f"Choose how you'd like to proceed:",
-        reply_markup=_checkout_keyboard(product.id),
+        reply_markup=_checkout_keyboard(product.id, allow_promo=product.allow_promo),
     )
     await callback.answer()
 
@@ -354,7 +358,7 @@ async def on_back_to_checkout(
         f"<b>Stock:</b>    {stock} unit(s)\n"
         f"<b>Balance:</b>  ${balance:.2f}\n\n"
         f"Choose how you'd like to proceed:",
-        reply_markup=_checkout_keyboard(product.id),
+        reply_markup=_checkout_keyboard(product.id, allow_promo=product.allow_promo),
     )
     await callback.answer()
 
@@ -403,15 +407,17 @@ async def process_promo_code(
     bot: Bot,
     user_repo: UserRepository,
     product_repo: ProductRepository,
+    inventory_repo: InventoryRepository,
+    order_repo: OrderRepository,
     promo_repo: PromoCodeRepository,
 ) -> None:
     """
     Receive the promo code typed by the user.
 
     1. Validate user + product still exist
-    2. Create a PromoOrderRequest (PENDING)
-    3. Notify admin(s) with Approve/Reject buttons
-    4. Confirm to user that code is under review
+    2. Check if product allows promo codes
+    3. Validate promo code exists and is active
+    4. Auto-fulfill: lock inventory + mark sold + deliver code
     """
     code_input = message.text.strip()
 
@@ -433,79 +439,68 @@ async def process_promo_code(
         return
 
     product = await product_repo.get_by_id(product_id)
-    if not product:
+    if not product or not product.is_available:
         await state.clear()
         await message.answer("⚠️ Product no longer available.")
         return
 
-    # ── Create the pending request ────────────────────────────
-    request = await promo_repo.create_request(
-        user_id=db_user.id,
-        product_id=product_id,
-        promo_code=code_input,
-    )
+    if not product.allow_promo:
+        await state.clear()
+        await message.answer("⚠️ This product does not accept promo codes.")
+        return
+
+    # ── Validate the promo code ──────────────────────────────
+    valid_code = await promo_repo.get_code(code_input)
+    if not valid_code:
+        await message.answer("❌ Invalid promo code.")
+        return
+
+    if valid_code.product_id and valid_code.product_id != product.id:
+        await message.answer("❌ This promo code is not valid for this product.")
+        return
+
+    if valid_code.max_uses > 0 and valid_code.used_count >= valid_code.max_uses:
+        await message.answer("❌ This promo code has reached its usage limit.")
+        return
 
     await state.clear()
 
-    # ── Confirm to user ───────────────────────────────────────
+    # ── Auto-fulfill order ───────────────────────────
+    locked_item = await inventory_repo.lock_available_item(product.id)
+    if locked_item is None:
+        await message.answer("😔 Out of stock!")
+        return
+
+    await inventory_repo.mark_as_sold(
+        inventory_id=locked_item.id,
+        buyer_id=db_user.id,
+    )
+    order, _ = await order_repo.create_full_order(
+        user_id=db_user.id,
+        product_id=product.id,
+        inventory_id=locked_item.id,
+        price=0.0,
+    )
+    
+    await promo_repo.increment_used(valid_code.id)
+
+    logger.info(
+        "Promo purchase auto-completed",
+        order_id=order.id,
+        product_id=product.id,
+        user_id=db_user.id,
+        promo_code=code_input,
+    )
+
     await message.answer(
-        f"✅ <b>Promo Code Submitted!</b>\n\n"
-        f"<b>Code:</b>     <code>{code_input.upper()}</code>\n"
-        f"<b>Product:</b>  {product.name}\n"
-        f"<b>Status:</b>   ⏳ Awaiting admin verification\n\n"
-        f"You'll be notified once an admin reviews your code.\n"
-        f"This usually takes a few minutes.",
-        parse_mode="HTML",
+        f"✅ <b>Promo Code Accepted!</b>\n\n"
+        f"<b>Product:</b> {product.name}\n"
+        f"<b>Order:</b>   #{order.id}\n\n"
+        f"🔐 <b>Your Digital Code</b>\n"
+        f"<tg-spoiler>{locked_item.data}</tg-spoiler>\n\n"
+        f"<i>⚠️ Save this code — it will not be shown again.</i>",
+        parse_mode="HTML"
     )
-
-    # ── Build admin notification ──────────────────────────────
-    approve_reject_kb = InlineKeyboardBuilder()
-    approve_reject_kb.row(
-        InlineKeyboardButton(
-            text="✅ Approve",
-            callback_data=PromoOrderCallback(
-                action=PromoOrderAction.APPROVE,
-                request_id=request.id,
-            ).pack(),
-        ),
-        InlineKeyboardButton(
-            text="❌ Reject",
-            callback_data=PromoOrderCallback(
-                action=PromoOrderAction.REJECT,
-                request_id=request.id,
-            ).pack(),
-        ),
-    )
-
-    admin_text = (
-        f"🎁 <b>Promo Code Checkout Request</b>\n\n"
-        f"<b>Request ID:</b>  #{request.id}\n"
-        f"<b>User:</b>        {db_user.first_name} (@{db_user.username or '—'})\n"
-        f"<b>Telegram ID:</b> <code>{db_user.telegram_id}</code>\n"
-        f"<b>Product:</b>     {product.name}\n"
-        f"<b>Price:</b>       ${product.price:.2f}\n"
-        f"<b>Code Entered:</b> <code>{code_input.upper()}</code>\n"
-        f"<b>Status:</b>      ⏳ Pending"
-    )
-
-    for admin_id in settings.bot.admin_ids:
-        try:
-            sent = await bot.send_message(
-                admin_id,
-                admin_text,
-                parse_mode="HTML",
-                reply_markup=approve_reject_kb.as_markup(),
-            )
-            # Use the SAME injected session (promo_repo) — it can see the
-            # flushed-but-uncommitted request row within the same transaction.
-            # A separate session would NOT see it (READ COMMITTED isolation).
-            await promo_repo.set_admin_message(
-                request_id=request.id,
-                admin_chat_id=admin_id,
-                admin_message_id=sent.message_id,
-            )
-        except Exception as e:
-            logger.warning("Failed to notify admin about promo request", error=str(e))
 
 
 @router.message(CheckoutForm.waiting_for_promo_code, F.text.startswith("/cancel"))

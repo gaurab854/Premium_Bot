@@ -49,9 +49,15 @@ class Product(Base):
     is_available: Mapped[bool] = mapped_column(
         Boolean,
         default=True,
-        server_default="true",
         nullable=False,
         comment="Whether the product is listed for sale",
+    )
+    allow_promo: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default="false",
+        nullable=False,
+        comment="Whether the product accepts promo codes",
     )
 
     # ── Relationships ─────────────────────────────────────────

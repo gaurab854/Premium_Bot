@@ -22,6 +22,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.redis import RedisStorage
+from aiogram.types import TelegramObject
 from aiogram.webhook.aiohttp_server import (
     SimpleRequestHandler,
     setup_application,
@@ -32,6 +33,7 @@ import structlog
 
 from config import settings
 from database import async_engine, Base
+from sqlalchemy import text
 
 # ── Import routers ────────────────────────────────────────────
 from bot.handlers import common, admin, user, deposit, purchase, checkout
@@ -51,6 +53,29 @@ async def on_startup(bot: Bot) -> None:
     # Create tables if they don't exist (use Alembic in production)
     async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        
+        # Apply schema updates automatically for zero-downtime deployment
+        try:
+            await conn.execute(text("ALTER TABLE products ADD COLUMN allow_promo BOOLEAN NOT NULL DEFAULT FALSE;"))
+            structlog.get_logger().info("Added 'allow_promo' column to products table.")
+        except Exception as e:
+            if "already exists" not in str(e).lower() and "duplicate column" not in str(e).lower():
+                structlog.get_logger().error("Failed to add 'allow_promo' column", error=str(e))
+
+        # ── Update OrderItem constraint (allow deletion with history) ──
+        try:
+            # Drop old constraint if it exists and recreate with CASCADE
+            await conn.execute(text("ALTER TABLE order_items DROP CONSTRAINT IF EXISTS order_items_product_id_fkey;"))
+            await conn.execute(text("""
+                ALTER TABLE order_items 
+                ADD CONSTRAINT order_items_product_id_fkey 
+                FOREIGN KEY (product_id) 
+                REFERENCES products(id) 
+                ON DELETE CASCADE;
+            """))
+            structlog.get_logger().info("Updated order_items foreign key to ON DELETE CASCADE.")
+        except Exception as e:
+            structlog.get_logger().error("Failed to update order_items constraint", error=str(e))
 
     # ── Set webhook if enabled ────────────────────────────────
     if settings.webhook.enabled:
@@ -153,9 +178,9 @@ def _build_dispatcher(storage: RedisStorage) -> Dispatcher:
     # Channel gate runs FIRST (outermost) so non-members can't bypass it
     dp.message.middleware(ChannelMemberMiddleware())
     dp.callback_query.middleware(ChannelMemberMiddleware())
+    dp.message.middleware(ThrottlingMiddleware(rate_limit=settings.rate_limit))
     dp.message.middleware(DatabaseMiddleware())
     dp.callback_query.middleware(DatabaseMiddleware())
-    dp.message.middleware(ThrottlingMiddleware(rate_limit=settings.rate_limit))
 
     # ── Include routers ───────────────────────────────────────
     dp.include_routers(
@@ -166,6 +191,35 @@ def _build_dispatcher(storage: RedisStorage) -> Dispatcher:
         user.router,
         common.router,     # catch-all last
     )
+
+    # ── Global Error Handler ──────────────────────────────────
+    @dp.error()
+    async def global_error_handler(event: TelegramObject, exception: Exception) -> None:
+        """Log errors and notify admins."""
+        structlog.get_logger().error(
+            "Unhandled exception",
+            error=str(exception),
+            event_type=type(event).__name__,
+            exc_info=True,
+        )
+        
+        # Notify admins if possible
+        for admin_id in settings.bot.admin_ids:
+            try:
+                # Use the bot from context if available
+                bot = getattr(event, "bot", None)
+                if not bot:
+                    continue
+                    
+                await bot.send_message(
+                    admin_id,
+                    f"🚨 <b>Unhandled Error</b>\n\n"
+                    f"<b>Type:</b> <code>{type(exception).__name__}</code>\n"
+                    f"<b>Message:</b> <code>{str(exception)}</code>\n\n"
+                    f"Check server logs for traceback."
+                )
+            except Exception:
+                pass
 
     return dp
 

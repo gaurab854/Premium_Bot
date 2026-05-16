@@ -35,7 +35,7 @@ class OrderItem(Base):
     )
     product_id: Mapped[int] = mapped_column(
         BigInteger,
-        ForeignKey("products.id", ondelete="RESTRICT"),
+        ForeignKey("products.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
         comment="Purchased product",
