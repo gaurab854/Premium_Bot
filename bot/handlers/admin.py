@@ -149,16 +149,25 @@ async def process_product_description(message: Message, state: FSMContext) -> No
     raw = message.text.strip()
     description = None if raw == "-" else raw
 
-    await state.update_data(product_description=description)
-    await state.set_state(AddProductForm.waiting_for_codes)
+    fsm_data = await state.get_data()
+    category = fsm_data.get("product_category")
 
-    await message.answer(
-        f"✅ Description saved.\n\n"
-        "<b>Step 5/5</b> — Now enter the <b>inventory codes</b> (the digital goods/slots).\n\n"
-        "📋 Send <b>one code per line</b>:\n"
-        "<code>CODE1234\nCODE5678\nCODE9012</code>\n\n"
-        "<i>Each line = one unit of stock. You can add more later with /addstock.</i>"
-    )
+    if category == "GMAIL":
+        await state.set_state(AddProductForm.waiting_for_stock_count)
+        await message.answer(
+            f"✅ Description saved.\n\n"
+            "<b>Step 5/5</b> — How many stocks (invitations) are available?\n\n"
+            "<i>Enter a number (e.g. 50).</i>"
+        )
+    else:
+        await state.set_state(AddProductForm.waiting_for_codes)
+        await message.answer(
+            f"✅ Description saved.\n\n"
+            "<b>Step 5/5</b> — Now enter the <b>inventory codes</b> (the digital goods/slots).\n\n"
+            "📋 Send <b>one code per line</b>:\n"
+            "<code>CODE1234\nCODE5678\nCODE9012</code>\n\n"
+            "<i>Each line = one unit of stock. You can add more later with /addstock.</i>"
+        )
 
 
 @router.message(AddProductForm.waiting_for_codes, F.text & ~F.text.startswith("/"))
@@ -207,6 +216,94 @@ async def process_product_codes(
         f"<b>Price:</b>       ${product.price:.2f}\n"
         f"<b>Category:</b>    {product.category or '—'}\n"
         f"<b>Stock added:</b> {count} code(s)\n\n"
+        f"📢 Sending announcement to the channel..."
+    )
+
+    # ── Announce to channel & users ───────────────────────────
+    desc_text = f"\n📄 {product.description}\n" if product.description else ""
+    cat_text = f"🏷️ <b>Category:</b> {product.category}\n" if product.category else ""
+    announcement_text = (
+        f"🆕 <b>New Product Available!</b>\n\n"
+        f"🛍️ <b>{product.name}</b>\n"
+        f"{desc_text}"
+        f"\n{cat_text}"
+        f"💰 <b>Price:</b> ${product.price:.2f}\n"
+        f"📦 <b>In Stock:</b> {count} unit(s)\n\n"
+        f"👉 Use /shop in the bot to purchase!"
+    )
+
+    if settings.bot.channel_id:
+        try:
+            await bot.send_message(settings.bot.channel_id, announcement_text)
+            await message.answer("✅ Channel announcement sent!")
+        except Exception as e:
+            logger.warning("Failed to send channel announcement", error=str(e))
+            await message.answer(
+                f"⚠️ Product added but channel announcement failed: {e}\n"
+                "Make sure the bot is an admin in your channel."
+            )
+    else:
+        await message.answer(
+            "ℹ️ No channel configured. Set <code>BOT_CHANNEL_ID</code> in your .env "
+            "to enable channel announcements."
+        )
+
+    await message.answer("📢 Broadcasting announcement to all users. This might take a moment...")
+    sent = await broadcast_announcement(bot, user_repo, announcement_text)
+    await message.answer(f"✅ Announcement sent to {sent} user(s)!")
+
+
+@router.message(AddProductForm.waiting_for_stock_count, F.text & ~F.text.startswith("/"))
+async def process_product_stock_count(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    product_repo: ProductRepository,
+    inventory_repo: InventoryRepository,
+    user_repo: UserRepository,
+) -> None:
+    """Save the GMAIL product with a specified number of placeholder stock items."""
+    raw = message.text.strip()
+    if not raw.isdigit():
+        await message.answer("⚠️ Please enter a valid number (e.g. 50).")
+        return
+    
+    count = int(raw)
+    if count <= 0:
+        await message.answer("⚠️ Stock count must be greater than 0.")
+        return
+
+    codes = ["[GMAIL INVITE]" for _ in range(count)]
+
+    fsm_data = await state.get_data()
+    await state.clear()
+
+    # ── Create the product ────────────────────────────────────
+    product = await product_repo.create(
+        name=fsm_data["product_name"],
+        price=fsm_data["product_price"],
+        description=fsm_data.get("product_description"),
+        category=fsm_data.get("product_category"),
+    )
+
+    # ── Bulk-add inventory ────────────────────────────────────
+    await inventory_repo.add_bulk(product.id, codes)
+
+    logger.info(
+        "Product created (GMAIL)",
+        product_id=product.id,
+        name=product.name,
+        price=product.price,
+        codes_added=count,
+    )
+
+    await message.answer(
+        f"✅ <b>Product Added Successfully!</b>\n\n"
+        f"<b>ID:</b>          #{product.id}\n"
+        f"<b>Name:</b>        {product.name}\n"
+        f"<b>Price:</b>       ${product.price:.2f}\n"
+        f"<b>Category:</b>    {product.category or '—'}\n"
+        f"<b>Stock added:</b> {count} invitation(s)\n\n"
         f"📢 Sending announcement to the channel..."
     )
 
@@ -317,20 +414,30 @@ async def cmd_addstock(
 
     stock = await inventory_repo.count_available(product_id)
 
-    # ── Set FSM state directly to waiting_for_codes ──
-    await state.set_state(AddStockForm.waiting_for_codes)
     await state.update_data(addstock_product_id=product_id)
 
-    await message.answer(
-        f"📦 <b>Adding stock to: {product.name}</b>\n"
-        f"Current stock: {stock} unit(s)\n\n"
-        f"Now send the codes, <b>one per line</b>:\n"
-        f"<code>CODE1\nCODE2\nCODE3</code>\n\n"
-        f"Send /cancel to abort."
-    )
+    if product.category == "GMAIL":
+        await state.set_state(AddStockForm.waiting_for_stock_count)
+        await message.answer(
+            f"📦 <b>Adding stock to: {product.name}</b>\n"
+            f"Current stock: {stock} unit(s)\n\n"
+            f"How many stocks (invitations) are you adding?\n"
+            f"<i>Enter a number (e.g. 50).</i>\n\n"
+            f"Send /cancel to abort."
+        )
+    else:
+        await state.set_state(AddStockForm.waiting_for_codes)
+        await message.answer(
+            f"📦 <b>Adding stock to: {product.name}</b>\n"
+            f"Current stock: {stock} unit(s)\n\n"
+            f"Now send the codes, <b>one per line</b>:\n"
+            f"<code>CODE1\nCODE2\nCODE3</code>\n\n"
+            f"Send /cancel to abort."
+        )
 
 
 @router.message(AddStockForm.waiting_for_codes, Command("cancel"))
+@router.message(AddStockForm.waiting_for_stock_count, Command("cancel"))
 async def cancel_addstock(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer("❌ Cancelled. Stock was not added.")
@@ -376,6 +483,84 @@ async def process_addstock_codes(
         f"✅ <b>Stock Updated!</b>\n\n"
         f"<b>Product:</b>    {product.name}\n"
         f"<b>Added:</b>      {count} code(s)\n"
+        f"<b>Total stock:</b> {new_stock} unit(s)\n\n"
+        f"📢 Sending announcement to the channel..."
+    )
+
+    # ── Announce stock restock to channel & users ────────────
+    announcement_text = (
+        f"🔄 <b>Stock Restocked!</b>\n\n"
+        f"🛍️ <b>{product.name}</b>\n"
+        f"📦 <b>Available now:</b> {new_stock} unit(s)\n\n"
+        f"👉 Use /shop in the bot to purchase!"
+    )
+
+    if settings.bot.channel_id:
+        try:
+            await bot.send_message(settings.bot.channel_id, announcement_text)
+            await message.answer("✅ Channel announcement sent!")
+        except Exception as e:
+            logger.warning("Failed to send stock announcement", error=str(e))
+            await message.answer(
+                f"⚠️ Stock added but channel announcement failed: {e}\n"
+                "Make sure the bot is an admin in your channel."
+            )
+    else:
+        await message.answer(
+            "ℹ️ No channel configured. Set <code>BOT_CHANNEL_ID</code> in your .env "
+            "to enable channel announcements."
+        )
+
+    await message.answer("📢 Broadcasting restock announcement to all users. This might take a moment...")
+    sent = await broadcast_announcement(bot, user_repo, announcement_text)
+    await message.answer(f"✅ Restock announcement sent to {sent} user(s)!")
+
+
+@router.message(AddStockForm.waiting_for_stock_count, F.text & ~F.text.startswith("/"))
+async def process_addstock_count(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    inventory_repo: InventoryRepository,
+    product_repo: ProductRepository,
+    user_repo: UserRepository,
+) -> None:
+    """Receive number of GMAIL invitations and bulk-insert placeholders."""
+    raw = message.text.strip()
+    if not raw.isdigit():
+        await message.answer("⚠️ Please enter a valid number (e.g. 50).")
+        return
+    
+    count = int(raw)
+    if count <= 0:
+        await message.answer("⚠️ Stock count must be greater than 0.")
+        return
+
+    codes = ["[GMAIL INVITE]" for _ in range(count)]
+
+    fsm_data = await state.get_data()
+    product_id = fsm_data.get("addstock_product_id")
+    await state.clear()
+
+    product = await product_repo.get_by_id(product_id)
+    if not product:
+        await message.answer(f"⚠️ Product #{product_id} no longer exists.")
+        return
+
+    await inventory_repo.add_bulk(product_id, codes)
+    new_stock = await inventory_repo.count_available(product_id)
+
+    logger.info(
+        "Stock added (GMAIL)",
+        product_id=product_id,
+        codes_added=count,
+        new_total=new_stock,
+    )
+
+    await message.answer(
+        f"✅ <b>Stock Updated!</b>\n\n"
+        f"<b>Product:</b>    {product.name}\n"
+        f"<b>Added:</b>      {count} invitation(s)\n"
         f"<b>Total stock:</b> {new_stock} unit(s)\n\n"
         f"📢 Sending announcement to the channel..."
     )

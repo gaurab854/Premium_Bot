@@ -42,6 +42,7 @@ class AddProductForm(StatesGroup):
     waiting_for_category = State()
     waiting_for_description = State()
     waiting_for_codes = State()
+    waiting_for_stock_count = State()
 
 
 class EditProductForm(StatesGroup):
@@ -65,3 +66,4 @@ class AddStockForm(StatesGroup):
     Steps: /addstock <id> → waiting_for_codes (admin sends codes one per line)
     """
     waiting_for_codes = State()
+    waiting_for_stock_count = State()
