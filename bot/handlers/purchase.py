@@ -170,13 +170,6 @@ async def on_product_view(
                     product_id=product.id,
                 ).pack(),
             ),
-            InlineKeyboardButton(
-                text="🎁 Promo Code",
-                callback_data=CheckoutCallback(
-                    action=CheckoutAction.PROMO,
-                    product_id=product.id,
-                ).pack(),
-            ),
         )
 
     builder.row(

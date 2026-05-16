@@ -104,22 +104,22 @@ async def process_product_price(message: Message, state: FSMContext) -> None:
     await state.set_state(AddProductForm.waiting_for_category)
     await message.answer(
         f"✅ Price: <b>${price:.2f}</b>\n\n"
-        "<b>Step 3/5</b> — Enter the <b>category</b>:\n\n"
-        "<i>Examples: Streaming, VPN, Software, Gift Cards</i>\n\n"
-        "Or send <code>-</code> to skip."
+        "<b>Step 3/5</b> — Choose the <b>category</b>:\n\n"
+        "Reply with either <code>LINK</code> or <code>GMAIL</code>."
     )
 
 
 @router.message(AddProductForm.waiting_for_category, F.text & ~F.text.startswith("/"))
 async def process_product_category(message: Message, state: FSMContext) -> None:
-    raw = message.text.strip()
-    category = None if raw == "-" else raw[:128]
+    category = message.text.strip().upper()
+    if category not in ("LINK", "GMAIL"):
+        await message.answer("⚠️ Please reply with either <code>LINK</code> or <code>GMAIL</code>.")
+        return
 
     await state.update_data(product_category=category)
     await state.set_state(AddProductForm.waiting_for_description)
-    cat_display = category or "None"
     await message.answer(
-        f"✅ Category: <b>{cat_display}</b>\n\n"
+        f"✅ Category: <b>{category}</b>\n\n"
         "<b>Step 4/5</b> — Enter the <b>description</b>:\n\n"
         "<i>What does the user get? e.g. '1-month Netflix Premium with 4 screens'</i>\n\n"
         "Or send <code>-</code> to skip."
@@ -132,29 +132,11 @@ async def process_product_description(message: Message, state: FSMContext) -> No
     description = None if raw == "-" else raw
 
     await state.update_data(product_description=description)
-    await state.set_state(AddProductForm.waiting_for_allow_promo)
-
-    await message.answer(
-        f"✅ Description saved.\n\n"
-        "<b>Step 5/6</b> — Do you want to allow <b>promo codes</b> for this product?\n\n"
-        "Reply <code>yes</code> to allow promo codes, or <code>no</code> to disable them."
-    )
-
-
-@router.message(AddProductForm.waiting_for_allow_promo, F.text & ~F.text.startswith("/"))
-async def process_product_allow_promo(message: Message, state: FSMContext) -> None:
-    raw = message.text.strip().lower()
-    if raw not in ("yes", "no", "y", "n"):
-        await message.answer("⚠️ Please answer with <code>yes</code> or <code>no</code>.")
-        return
-        
-    allow_promo = raw in ("yes", "y")
-    await state.update_data(product_allow_promo=allow_promo)
     await state.set_state(AddProductForm.waiting_for_codes)
 
     await message.answer(
-        f"✅ Promo codes allowed: <b>{'Yes' if allow_promo else 'No'}</b>\n\n"
-        "<b>Step 6/6</b> — Now enter the <b>inventory codes</b> (the digital goods).\n\n"
+        f"✅ Description saved.\n\n"
+        "<b>Step 5/5</b> — Now enter the <b>inventory codes</b> (the digital goods/slots).\n\n"
         "📋 Send <b>one code per line</b>:\n"
         "<code>CODE1234\nCODE5678\nCODE9012</code>\n\n"
         "<i>Each line = one unit of stock. You can add more later with /addstock.</i>"
@@ -186,7 +168,6 @@ async def process_product_codes(
         price=fsm_data["product_price"],
         description=fsm_data.get("product_description"),
         category=fsm_data.get("product_category"),
-        allow_promo=fsm_data.get("product_allow_promo", False),
     )
 
     # ── Bulk-add inventory ────────────────────────────────────
@@ -313,37 +294,13 @@ async def cmd_addstock(
 
     stock = await inventory_repo.count_available(product_id)
 
-    # ── Set FSM state so the next message is captured as allow_promo ──
-    await state.set_state(AddStockForm.waiting_for_allow_promo)
+    # ── Set FSM state directly to waiting_for_codes ──
+    await state.set_state(AddStockForm.waiting_for_codes)
     await state.update_data(addstock_product_id=product_id)
 
-    promo_status = "Enabled" if product.allow_promo else "Disabled"
     await message.answer(
         f"📦 <b>Adding stock to: {product.name}</b>\n"
-        f"Current stock: {stock} unit(s)\n"
-        f"Promo codes: {promo_status}\n\n"
-        f"Do you want to allow promo codes for this product? "
-        f"Reply <code>yes</code> to allow, <code>no</code> to disable, or <code>skip</code> to keep current setting.\n\n"
-        f"Send /cancel to abort."
-    )
-
-@router.message(AddStockForm.waiting_for_allow_promo, F.text & ~F.text.startswith("/"))
-async def process_addstock_allow_promo(message: Message, state: FSMContext, product_repo: ProductRepository) -> None:
-    raw = message.text.strip().lower()
-    fsm_data = await state.get_data()
-    product_id = fsm_data.get("addstock_product_id")
-    
-    if raw not in ("yes", "no", "y", "n", "skip"):
-        await message.answer("⚠️ Please answer with <code>yes</code>, <code>no</code>, or <code>skip</code>.")
-        return
-        
-    if raw != "skip":
-        allow_promo = raw in ("yes", "y")
-        await product_repo.set_allow_promo(product_id, allow_promo=allow_promo)
-        await message.answer(f"✅ Promo code setting updated to: <b>{'Yes' if allow_promo else 'No'}</b>")
-
-    await state.set_state(AddStockForm.waiting_for_codes)
-    await message.answer(
+        f"Current stock: {stock} unit(s)\n\n"
         f"Now send the codes, <b>one per line</b>:\n"
         f"<code>CODE1\nCODE2\nCODE3</code>\n\n"
         f"Send /cancel to abort."

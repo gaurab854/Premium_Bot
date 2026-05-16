@@ -35,13 +35,12 @@ class DepositForm(StatesGroup):
 class AddProductForm(StatesGroup):
     """
     Admin add-product FSM.
-    Steps: name → price → category → description → inventory codes
+    Steps: name → price → category (LINK/GMAIL) → description → inventory codes
     """
     waiting_for_name = State()
     waiting_for_price = State()
     waiting_for_category = State()
     waiting_for_description = State()
-    waiting_for_allow_promo = State()
     waiting_for_codes = State()
 
 
@@ -55,22 +54,9 @@ class EditProductForm(StatesGroup):
 class CheckoutForm(StatesGroup):
     """
     Checkout flow — entered when user taps [Buy] on a product.
-
-    Pay path:    → payment details sent immediately (no extra state)
-    Promo path:  → waiting_for_promo_code: collect typed code
+    If product is GMAIL, asks user to reply with Gmail address.
     """
-    waiting_for_promo_code = State()
-
-
-class AddPromoForm(StatesGroup):
-    """
-    Admin add-promo-code FSM.
-    Steps: code string → description → max_uses → product_id (optional)
-    """
-    waiting_for_code = State()
-    waiting_for_description = State()
-    waiting_for_max_uses = State()
-    waiting_for_product_id = State()
+    waiting_for_gmail = State()
 
 
 class AddStockForm(StatesGroup):
@@ -78,5 +64,4 @@ class AddStockForm(StatesGroup):
     Admin add-stock FSM.
     Steps: /addstock <id> → waiting_for_codes (admin sends codes one per line)
     """
-    waiting_for_allow_promo = State()
     waiting_for_codes = State()

@@ -1,31 +1,11 @@
 """
-Checkout handler — the full buy flow with Pay / Promo Code branching.
-
-Flow overview:
-    User taps [View] on a product → sees details + [💳 Pay] [🎁 Promo Code]
-
-    Branch A — Pay:
-        Bot shows payment method selection (Bybit / BEP-20 / Plasma)
-        User picks method → bot shows address + instructions
-        → User goes to /deposit to fund wallet, then buys from /shop
-
-    Branch B — Promo Code:
-        Bot asks user to type their code
-        User sends code → PromoOrderRequest saved as PENDING
-        → Admin notified with [✅ Approve] [❌ Reject]
-        → On approve: inventory locked + code delivered to user
-        → On reject: user notified + checkout keyboard re-shown
-
-Design notes:
-    • The Pay path (wallet-funded instant purchase) is handled by purchase.py.
-      This handler replaces the raw [Buy] button with a checkout gateway.
-    • The promo path is fully manual approval — no wallet deduction.
-    • All DB mutations in approve/reject use a fresh session with begin()
-      for atomic inventory lock + order creation.
+Checkout handler — handles wallet deduction, inventory assignment, and order creation.
+Also handles GMAIL specific flows.
 """
 
 from __future__ import annotations
 
+import re
 import structlog
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
@@ -40,27 +20,23 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from bot.callbacks.checkout import (
     CheckoutAction,
     CheckoutCallback,
-    PromoOrderAction,
-    PromoOrderCallback,
+    GmailInviteCallback,
 )
 from bot.callbacks.purchase import ProductAction, ProductCallback
 from bot.states.user import CheckoutForm
 from config import settings
 from database import async_session_factory
-from database.models.promo_order_request import PromoOrderStatus
 from database.repositories.inventory import InventoryRepository
 from database.repositories.order import OrderRepository
 from database.repositories.product import ProductRepository
-from database.repositories.promo_code import PromoCodeRepository
 from database.repositories.user import UserRepository
 from database.repositories.wallet import WalletRepository
-from database.models.promo_order_request import PromoOrderStatus
 
 logger = structlog.get_logger()
 
 router = Router(name="checkout")
 
-# ── Payment info (shown in Pay flow) ──────────────────────────────────────────
+# ── Payment info (shown if insufficient balance) ──────────────────────────────
 PAYMENT_INFO = {
     "bybit": {
         "label": "🟡 Bybit UID",
@@ -80,126 +56,20 @@ PAYMENT_INFO = {
 }
 
 
-def _checkout_keyboard(product_id: int, allow_promo: bool = False):
-    """The initial checkout choice keyboard shown to the user."""
-    builder = InlineKeyboardBuilder()
-    row = [
-        InlineKeyboardButton(
-            text="💳 Pay",
-            callback_data=CheckoutCallback(
-                action=CheckoutAction.PAY,
-                product_id=product_id,
-            ).pack(),
-        )
-    ]
-    if allow_promo:
-        row.append(
-            InlineKeyboardButton(
-                text="🎁 Use Promo Code",
-                callback_data=CheckoutCallback(
-                    action=CheckoutAction.PROMO,
-                    product_id=product_id,
-                ).pack(),
-            )
-        )
-    builder.row(*row)
-    builder.row(
-        InlineKeyboardButton(
-            text="🔙 Back to Shop",
-            callback_data="back_to_shop",
-        ),
-    )
-    return builder.as_markup()
-
-
-def _pay_method_keyboard(product_id: int):
-    """Payment method selection after user picks 'Pay'."""
-    builder = InlineKeyboardBuilder()
-    for key, info in PAYMENT_INFO.items():
-        builder.row(
-            InlineKeyboardButton(
-                text=info["label"],
-                callback_data=f"checkout_pay_method:{product_id}:{key}",
-            )
-        )
-    builder.row(
-        InlineKeyboardButton(
-            text="🔙 Back",
-            callback_data=CheckoutCallback(
-                action=CheckoutAction.PAY,
-                product_id=product_id,
-            ).pack(),
-        ),
-    )
-    return builder.as_markup()
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  INTERCEPT the raw [Buy] callback and show checkout screen instead
-# ═════════════════════════════════════════════════════════════════════════════
-
-@router.callback_query(
-    ProductCallback.filter(F.action == ProductAction.BUY),
-)
-async def on_checkout_entry(
+@router.callback_query(ProductCallback.filter(F.action == ProductAction.BUY))
+async def on_buy_clicked(
     callback: CallbackQuery,
     callback_data: ProductCallback,
-    product_repo: ProductRepository,
-    inventory_repo: InventoryRepository,
-    user_repo: UserRepository,
-    wallet_repo: WalletRepository,
-) -> None:
-    """
-    Intercept the [Buy] button — show the checkout gateway instead of
-    immediately processing the purchase.
-    """
-    product = await product_repo.get_by_id(callback_data.product_id)
-    if product is None or not product.is_available:
-        await callback.answer("⚠️ Product no longer available.", show_alert=True)
-        return
-
-    stock = await inventory_repo.count_available(product.id)
-    if stock == 0:
-        await callback.answer("😔 Out of stock!", show_alert=True)
-        return
-
-    db_user = await user_repo.get_by_telegram_id(callback.from_user.id)
-    balance = 0.0
-    if db_user:
-        balance = await wallet_repo.get_balance(user_id=db_user.id)
-
-    await callback.message.edit_text(
-        f"🛒 <b>Checkout</b>\n\n"
-        f"<b>Product:</b>  {product.name}\n"
-        f"<b>Price:</b>    ${product.price:.2f}\n"
-        f"<b>Stock:</b>    {stock} unit(s)\n"
-        f"<b>Balance:</b>  ${balance:.2f}\n\n"
-        f"Choose how you'd like to proceed:",
-        reply_markup=_checkout_keyboard(product.id, allow_promo=product.allow_promo),
-    )
-    await callback.answer()
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  Branch A — PAY (wallet-funded instant purchase)
-# ═════════════════════════════════════════════════════════════════════════════
-
-@router.callback_query(CheckoutCallback.filter(F.action == CheckoutAction.PAY))
-async def on_checkout_pay(
-    callback: CallbackQuery,
-    callback_data: CheckoutCallback,
     product_repo: ProductRepository,
     user_repo: UserRepository,
     wallet_repo: WalletRepository,
     inventory_repo: InventoryRepository,
     order_repo: OrderRepository,
+    state: FSMContext,
 ) -> None:
     """
-    User chose 'Pay'.
-
-    If they have enough balance → process the purchase immediately (same
-    atomic flow as before: lock inventory → deduct wallet → mark sold → deliver).
-
+    User chose 'Buy'.
+    If they have enough balance → process the purchase immediately.
     If not enough balance → show payment options so they can deposit first.
     """
     product = await product_repo.get_by_id(callback_data.product_id)
@@ -246,28 +116,48 @@ async def on_checkout_pay(
         )
 
         logger.info(
-            "Checkout purchase completed",
+            "Purchase completed",
             order_id=order.id,
             product_id=product.id,
             user_id=db_user.id,
         )
 
         new_balance = wallet.balance - product.price
-        await callback.message.edit_text(
-            f"🎉 <b>Purchase Successful!</b>\n\n"
-            f"<b>Product:</b>  {product.name}\n"
-            f"<b>Price:</b>    ${product.price:.2f}\n"
-            f"<b>Order:</b>    #{order.id}\n"
-        )
-        await callback.message.answer(
-            f"🔐 <b>Your Digital Code</b>\n\n"
-            f"<b>Product:</b> {product.name}\n"
-            f"<b>Order:</b>   #{order.id}\n\n"
-            f"<tg-spoiler>{locked_item.data}</tg-spoiler>\n\n"
-            f"<i>⚠️ Save this code — it will not be shown again.</i>\n"
-            f"<i>💰 Remaining balance: ${new_balance:.2f}</i>",
-        )
-        await callback.answer("✅ Purchase complete!")
+
+        # Check Category
+        is_gmail = product.category and product.category.upper() == "GMAIL"
+
+        if is_gmail:
+            await callback.message.edit_text(
+                f"🎉 <b>Purchase Successful!</b>\n\n"
+                f"<b>Product:</b>  {product.name}\n"
+                f"<b>Price:</b>    ${product.price:.2f}\n"
+                f"<b>Order:</b>    #{order.id}\n"
+            )
+            await callback.message.answer(
+                f"📧 <b>Gmail Required</b>\n\n"
+                f"To receive your invitation for <b>{product.name}</b>, please reply to this message with your Gmail address.\n\n"
+                f"<i>💰 Remaining balance: ${new_balance:.2f}</i>"
+            )
+            await state.set_state(CheckoutForm.waiting_for_gmail)
+            await state.update_data(checkout_order_id=order.id, checkout_product_name=product.name)
+            await callback.answer("✅ Purchase complete! Please provide your Gmail.")
+        else:
+            await callback.message.edit_text(
+                f"🎉 <b>Purchase Successful!</b>\n\n"
+                f"<b>Product:</b>  {product.name}\n"
+                f"<b>Price:</b>    ${product.price:.2f}\n"
+                f"<b>Order:</b>    #{order.id}\n"
+            )
+            await callback.message.answer(
+                f"🔐 <b>Your Digital Code</b>\n\n"
+                f"<b>Product:</b> {product.name}\n"
+                f"<b>Order:</b>   #{order.id}\n\n"
+                f"<tg-spoiler>{locked_item.data}</tg-spoiler>\n\n"
+                f"<i>⚠️ Save this code — it will not be shown again.</i>\n"
+                f"<i>💰 Remaining balance: ${new_balance:.2f}</i>",
+            )
+            await callback.answer("✅ Purchase complete!")
         return
 
     # ── Not enough balance → show how to deposit ─────────────
@@ -281,11 +171,8 @@ async def on_checkout_pay(
         )
     builder.row(
         InlineKeyboardButton(
-            text="🔙 Back",
-            callback_data=CheckoutCallback(
-                action=CheckoutAction.PAY,
-                product_id=product.id,
-            ).pack(),
+            text="🔙 Back to Shop",
+            callback_data="back_to_shop",
         ),
     )
 
@@ -316,7 +203,7 @@ async def on_pay_method_info(callback: CallbackQuery) -> None:
 
     builder = InlineKeyboardBuilder()
     builder.row(
-        InlineKeyboardButton(text="🔙 Back to Checkout", callback_data=f"back_checkout:{product_id}"),
+        InlineKeyboardButton(text="🔙 Back", callback_data=f"back_checkout:{product_id}"),
     )
 
     await callback.message.edit_text(
@@ -338,7 +225,7 @@ async def on_back_to_checkout(
     user_repo: UserRepository,
     wallet_repo: WalletRepository,
 ) -> None:
-    """Return user to the checkout screen."""
+    """Return user to the payment options screen."""
     product_id = int(callback.data.split(":")[1])
     product = await product_repo.get_by_id(product_id)
     if not product:
@@ -351,375 +238,118 @@ async def on_back_to_checkout(
         balance = await wallet_repo.get_balance(user_id=db_user.id)
     stock = await inventory_repo.count_available(product_id)
 
+    builder = InlineKeyboardBuilder()
+    for key, info in PAYMENT_INFO.items():
+        builder.row(
+            InlineKeyboardButton(
+                text=info["label"],
+                callback_data=f"checkout_pay_method:{product.id}:{key}",
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(
+            text="🔙 Back to Shop",
+            callback_data="back_to_shop",
+        ),
+    )
+
+    shortage = product.price - balance
     await callback.message.edit_text(
-        f"🛒 <b>Checkout</b>\n\n"
-        f"<b>Product:</b>  {product.name}\n"
-        f"<b>Price:</b>    ${product.price:.2f}\n"
-        f"<b>Stock:</b>    {stock} unit(s)\n"
-        f"<b>Balance:</b>  ${balance:.2f}\n\n"
-        f"Choose how you'd like to proceed:",
-        reply_markup=_checkout_keyboard(product.id, allow_promo=product.allow_promo),
+        f"💳 <b>Top Up Your Balance</b>\n\n"
+        f"<b>Product price:</b>  ${product.price:.2f}\n"
+        f"<b>Your balance:</b>   ${balance:.2f}\n"
+        f"<b>You need:</b>       ${shortage:.2f} more\n\n"
+        f"Choose a payment method to top up, then use /deposit to submit your TXID:",
+        reply_markup=builder.as_markup(),
     )
     await callback.answer()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  Branch B — PROMO CODE
+#  GMAIL INVITE FLOW
 # ═════════════════════════════════════════════════════════════════════════════
 
-@router.callback_query(CheckoutCallback.filter(F.action == CheckoutAction.PROMO))
-async def on_checkout_promo(
-    callback: CallbackQuery,
-    callback_data: CheckoutCallback,
-    state: FSMContext,
-    product_repo: ProductRepository,
-) -> None:
-    """User chose 'Use Promo Code' — store product_id in state and ask for code."""
-    product = await product_repo.get_by_id(callback_data.product_id)
-    if product is None:
-        await callback.answer("⚠️ Product not found.", show_alert=True)
-        return
-
-    await state.set_state(CheckoutForm.waiting_for_promo_code)
-    await state.update_data(checkout_product_id=callback_data.product_id)
-
-    await callback.message.edit_text(
-        f"🎁 <b>Enter Your Promo Code</b>\n\n"
-        f"Product: <b>{product.name}</b>\n\n"
-        f"Type and send your promo code below.\n"
-        f"It will be submitted to an admin for verification.\n\n"
-        f"Send /cancel to go back."
-    )
-    await callback.answer()
-
-
-@router.message(CheckoutForm.waiting_for_promo_code, Command("cancel"))
-async def cancel_promo_entry_cmd(message: Message, state: FSMContext) -> None:
-    """Cancel the promo code entry via /cancel command."""
-    await state.clear()
-    await message.answer("❌ Cancelled. Use /shop to browse products.")
-
-
-@router.message(CheckoutForm.waiting_for_promo_code, F.text & ~F.text.startswith("/"))
-async def process_promo_code(
-    message: Message,
-    state: FSMContext,
-    bot: Bot,
-    user_repo: UserRepository,
-    product_repo: ProductRepository,
-    inventory_repo: InventoryRepository,
-    order_repo: OrderRepository,
-    promo_repo: PromoCodeRepository,
-) -> None:
-    """
-    Receive the promo code typed by the user.
-
-    1. Validate user + product still exist
-    2. Check if product allows promo codes
-    3. Validate promo code exists and is active
-    4. Auto-fulfill: lock inventory + mark sold + deliver code
-    """
-    code_input = message.text.strip()
-
-    if len(code_input) < 2:
-        await message.answer("⚠️ Code too short. Please try again.")
-        return
-
-    fsm_data = await state.get_data()
-    product_id = fsm_data.get("checkout_product_id")
-    if not product_id:
-        await state.clear()
-        await message.answer("⚠️ Session expired. Please use /shop again.")
-        return
-
-    db_user = await user_repo.get_by_telegram_id(message.from_user.id)
-    if not db_user:
-        await state.clear()
-        await message.answer("⚠️ Please /start first.")
-        return
-
-    product = await product_repo.get_by_id(product_id)
-    if not product or not product.is_available:
-        await state.clear()
-        await message.answer("⚠️ Product no longer available.")
-        return
-
-    if not product.allow_promo:
-        await state.clear()
-        await message.answer("⚠️ This product does not accept promo codes.")
-        return
-
-    # ── Validate the promo code ──────────────────────────────
-    valid_code = await promo_repo.get_code(code_input)
-    if not valid_code:
-        await message.answer("❌ Invalid promo code.")
-        return
-
-    if valid_code.product_id and valid_code.product_id != product.id:
-        await message.answer("❌ This promo code is not valid for this product.")
-        return
-
-    if valid_code.max_uses > 0 and valid_code.used_count >= valid_code.max_uses:
-        await message.answer("❌ This promo code has reached its usage limit.")
-        return
-
-    await state.clear()
-
-    # ── Auto-fulfill order ───────────────────────────
-    locked_item = await inventory_repo.lock_available_item(product.id)
-    if locked_item is None:
-        await message.answer("😔 Out of stock!")
-        return
-
-    await inventory_repo.mark_as_sold(
-        inventory_id=locked_item.id,
-        buyer_id=db_user.id,
-    )
-    order, _ = await order_repo.create_full_order(
-        user_id=db_user.id,
-        product_id=product.id,
-        inventory_id=locked_item.id,
-        price=0.0,
-    )
+@router.message(CheckoutForm.waiting_for_gmail, F.text)
+async def on_gmail_provided(message: Message, state: FSMContext, bot: Bot) -> None:
+    """User provides their Gmail address."""
+    gmail = message.text.strip()
     
-    await promo_repo.increment_used(valid_code.id)
+    # Simple email validation, but specifically checking for @gmail.com or @googlemail.com
+    if not re.match(r"^[a-zA-Z0-9._%+-]+@(gmail|googlemail)\.com$", gmail.lower()):
+        await message.answer("⚠️ Please provide a valid Gmail address (e.g., example@gmail.com).")
+        return
 
-    logger.info(
-        "Promo purchase auto-completed",
-        order_id=order.id,
-        product_id=product.id,
-        user_id=db_user.id,
-        promo_code=code_input,
-    )
+    data = await state.get_data()
+    order_id = data.get("checkout_order_id")
+    product_name = data.get("checkout_product_name", "Unknown Product")
+
+    await state.clear()
 
     await message.answer(
-        f"✅ <b>Promo Code Accepted!</b>\n\n"
-        f"<b>Product:</b> {product.name}\n"
-        f"<b>Order:</b>   #{order.id}\n\n"
-        f"🔐 <b>Your Digital Code</b>\n"
-        f"<tg-spoiler>{locked_item.data}</tg-spoiler>\n\n"
-        f"<i>⚠️ Save this code — it will not be shown again.</i>",
-        parse_mode="HTML"
+        "✅ <b>Message sent to admin!</b>\n\n"
+        "Your Gmail address has been securely forwarded to the admin.\n"
+        "Please wait while they add you to the group/family. You will receive a notification here once it is done."
     )
 
+    # Notify admins
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(
+            text="✅ Sent",
+            callback_data=GmailInviteCallback(order_id=order_id, user_id=message.from_user.id).pack(),
+        )
+    )
 
-@router.message(CheckoutForm.waiting_for_promo_code, F.text.startswith("/cancel"))
-async def cancel_promo_entry(message: Message, state: FSMContext) -> None:
-    """Cancel the promo code entry."""
-    await state.clear()
-    await message.answer("❌ Cancelled. Use /shop to browse products.")
+    for admin_id in settings.bot.admin_ids:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🚨 <b>New GMAIL Order Action Required!</b>\n\n"
+                f"<b>Order:</b> #{order_id}\n"
+                f"<b>Product:</b> {product_name}\n"
+                f"<b>User:</b> @{message.from_user.username or message.from_user.id}\n"
+                f"<b>Gmail:</b> <code>{gmail}</code>\n\n"
+                f"Please manually add this user and click [Sent] below.",
+                reply_markup=kb.as_markup()
+            )
+        except Exception as e:
+            logger.warning("Failed to notify admin of Gmail order", admin_id=admin_id, error=str(e))
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  ADMIN — Approve / Reject promo-code checkout requests
-# ═════════════════════════════════════════════════════════════════════════════
-
-@router.callback_query(PromoOrderCallback.filter())
-async def handle_promo_order_decision(
+@router.callback_query(GmailInviteCallback.filter())
+async def on_admin_gmail_invite_sent(
     callback: CallbackQuery,
-    callback_data: PromoOrderCallback,
-    bot: Bot,
+    callback_data: GmailInviteCallback,
+    bot: Bot
 ) -> None:
-    """
-    Approve or Reject a promo-code order request.
-
-    APPROVE flow (atomic in one session):
-      1. Read request (no writes)
-      2. In ONE transaction: flip status + lock inventory + mark sold + create order
-         → If any step fails → everything rolls back → status stays PENDING → admin can retry
-      3. Send delivery message outside transaction
-
-    REJECT flow:
-      1. Read request + flip status (atomic)
-      2. Notify user
-    """
+    """Admin clicks [Sent] after manually processing the Gmail invite."""
     if callback.from_user.id not in settings.bot.admin_ids:
         await callback.answer("🚫 You are not an admin.", show_alert=True)
         return
 
-    request_id = callback_data.request_id
-    action = callback_data.action
-    status_text = "✅ <b>APPROVED</b>" if action == PromoOrderAction.APPROVE else "❌ <b>REJECTED</b>"
+    order_id = callback_data.order_id
+    user_id = callback_data.user_id
 
+    # Update admin message
     try:
-        # ── SESSION 1: read request primitives (READ ONLY, no writes) ──
-        user_id = product_id = telegram_id = None
-        promo_code = product_name = ""
-
-        async with async_session_factory() as s1:
-            req = await PromoCodeRepository(s1).get_request(request_id)
-            if req is None:
-                await callback.answer("⚠️ Request not found.", show_alert=True)
-                return
-            if req.status != PromoOrderStatus.PENDING:
-                await callback.answer(
-                    f"⚠️ Already {req.status.value.lower()}.", show_alert=True
-                )
-                return
-            user_id      = req.user_id
-            product_id   = req.product_id
-            promo_code   = req.promo_code
-            product_name = req.product.name if req.product else "N/A"
-
-        # ── SESSION 2: fetch user's telegram_id ───────────────────────
-        async with async_session_factory() as s2:
-            u = await UserRepository(s2).get_by_id(user_id)
-            telegram_id = u.telegram_id if u else None
-
-        # ══════════════════════════════════════════════════════════════
-        #  APPROVE — all writes in ONE atomic transaction
-        #  If lock_available_item fails → everything rolls back
-        #  → status stays PENDING → admin can safely retry
-        # ══════════════════════════════════════════════════════════════
-        if action == PromoOrderAction.APPROVE:
-            inventory_code: str | None = None
-            order_id: int | None = None
-
-            async with async_session_factory() as s3:
-                async with s3.begin():
-                    promo_repo3 = PromoCodeRepository(s3)
-                    inv_repo    = InventoryRepository(s3)
-                    order_repo  = OrderRepository(s3)
-
-                    # Flip status INSIDE the same transaction as inventory lock
-                    ok = await promo_repo3.approve_request(
-                        request_id, note=f"Approved by {callback.from_user.id}"
-                    )
-                    if not ok:
-                        await callback.answer("⚠️ Already processed.", show_alert=True)
-                        return
-
-                    # Lock one inventory item — FOR UPDATE SKIP LOCKED OF Inventory
-                    item = await inv_repo.lock_available_item(product_id)
-                    if item is None:
-                        # Raise so the transaction ROLLS BACK (status reverts to PENDING)
-                        raise RuntimeError("OUT_OF_STOCK")
-
-                    inventory_code = item.data
-                    await inv_repo.mark_as_sold(inventory_id=item.id, buyer_id=user_id)
-                    order, _ = await order_repo.create_full_order(
-                        user_id=user_id,
-                        product_id=product_id,
-                        inventory_id=item.id,
-                        price=0.0,
-                    )
-                    order_id = order.id
-
-            logger.info(
-                "Promo order approved and fulfilled",
-                request_id=request_id, order_id=order_id,
-                user_id=user_id, admin_id=callback.from_user.id,
-            )
-
-            # Deliver code OUTSIDE the transaction
-            if telegram_id and inventory_code:
-                try:
-                    await bot.send_message(
-                        telegram_id,
-                        f"✅ <b>Promo Code Approved!</b>\n\n"
-                        f"<b>Product:</b> {product_name}\n"
-                        f"<b>Order #:</b> {order_id}\n\n"
-                        f"🔐 <b>Your Digital Code:</b>\n"
-                        f"<tg-spoiler>{inventory_code}</tg-spoiler>\n\n"
-                        f"<i>⚠️ Save this — it won't be shown again.</i>",
-                        parse_mode="HTML",
-                    )
-                except Exception as e:
-                    logger.warning("Code delivery failed", error=str(e))
-
-        # ══════════════════════════════════════════════════════════════
-        #  REJECT — atomic status flip + notify user
-        # ══════════════════════════════════════════════════════════════
-        else:
-            async with async_session_factory() as s3:
-                async with s3.begin():
-                    ok = await PromoCodeRepository(s3).reject_request(
-                        request_id, note=f"Rejected by {callback.from_user.id}"
-                    )
-                    if not ok:
-                        await callback.answer("⚠️ Already processed.", show_alert=True)
-                        return
-
-            logger.info(
-                "Promo order rejected",
-                request_id=request_id, user_id=user_id, admin_id=callback.from_user.id,
-            )
-
-            if telegram_id:
-                try:
-                    kb = InlineKeyboardBuilder()
-                    kb.row(
-                        InlineKeyboardButton(
-                            text="💳 Pay",
-                            callback_data=CheckoutCallback(
-                                action=CheckoutAction.PAY, product_id=product_id
-                            ).pack(),
-                        ),
-                        InlineKeyboardButton(
-                            text="🎁 Try Another Code",
-                            callback_data=CheckoutCallback(
-                                action=CheckoutAction.PROMO, product_id=product_id
-                            ).pack(),
-                        ),
-                    )
-                    await bot.send_message(
-                        telegram_id,
-                        f"❌ <b>Promo Code Rejected</b>\n\n"
-                        f"<b>Code:</b>    <code>{promo_code}</code>\n"
-                        f"<b>Product:</b> {product_name}\n\n"
-                        f"Code was invalid or has expired.\n"
-                        f"You can try a different code or pay directly:",
-                        parse_mode="HTML",
-                        reply_markup=kb.as_markup(),
-                    )
-                except Exception as e:
-                    logger.warning("Reject notify failed", error=str(e))
-
-        # ── Edit admin message to show outcome ─────────────────────
-        try:
-            await callback.message.edit_text(
-                f"{callback.message.html_text}\n\n"
-                f"─────────────────────\n"
-                f"{status_text} by <code>{callback.from_user.id}</code>",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-
-        await callback.answer(
-            "Approved ✅" if action == PromoOrderAction.APPROVE else "Rejected ❌"
+        await callback.message.edit_text(
+            f"{callback.message.html_text}\n\n"
+            f"─────────────────────\n"
+            f"✅ <b>Invitation Sent</b> by <code>{callback.from_user.id}</code>",
+            parse_mode="HTML"
         )
+    except Exception:
+        pass
 
-    except RuntimeError as e:
-        if "OUT_OF_STOCK" in str(e):
-            # Status was rolled back — admin can retry after restocking
-            if telegram_id:
-                try:
-                    await bot.send_message(
-                        telegram_id,
-                        f"✅ <b>Promo Approved!</b>\n\n"
-                        f"<b>Product:</b> {product_name}\n\n"
-                        f"⚠️ Currently out of stock. You'll be notified when restocked.",
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
-            await callback.answer(
-                "⚠️ Approved but OUT OF STOCK — please add stock and retry.",
-                show_alert=True,
-            )
-        else:
-            logger.error("Promo decision error", error=str(e), request_id=request_id)
-            try:
-                await callback.answer(f"❌ Error: {str(e)[:150]}", show_alert=True)
-            except Exception:
-                pass
-
+    # Notify user
+    try:
+        await bot.send_message(
+            user_id,
+            f"🎉 <b>Invitation Sent!</b>\n\n"
+            f"Check your email and accept the invitation for Order #{order_id}.",
+            parse_mode="HTML"
+        )
     except Exception as e:
-        logger.error("Promo decision error", error=str(e), request_id=request_id)
-        try:
-            await callback.answer(f"❌ Error: {str(e)[:150]}", show_alert=True)
-        except Exception:
-            pass
+        logger.warning("Failed to notify user that invite was sent", user_id=user_id, error=str(e))
 
-
+    await callback.answer("Marked as Sent ✅")

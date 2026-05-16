@@ -12,7 +12,6 @@ from aiogram.filters.callback_data import CallbackData
 class CheckoutAction(str, Enum):
     """User's checkout choice."""
     PAY = "pay"
-    PROMO = "promo"
 
 
 class CheckoutCallback(CallbackData, prefix="checkout"):
@@ -24,16 +23,9 @@ class CheckoutCallback(CallbackData, prefix="checkout"):
     product_id: int
 
 
-class PromoOrderAction(str, Enum):
-    """Admin action on a promo order request."""
-    APPROVE = "approve"
-    REJECT = "reject"
-
-
-class PromoOrderCallback(CallbackData, prefix="promo_order"):
+class GmailInviteCallback(CallbackData, prefix="gmail_invite"):
     """
-    Admin approve/reject buttons for promo-code orders.
-    Serialises to: promo_order:<action>:<request_id>
+    Admin button to confirm a Gmail invite was sent.
     """
-    action: PromoOrderAction
-    request_id: int
+    order_id: int
+    user_id: int
