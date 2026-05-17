@@ -192,27 +192,42 @@ def _build_dispatcher(storage: RedisStorage) -> Dispatcher:
         common.router,     # catch-all last
     )
 
-    # ── Global Error Handler ──────────────────────────────────
+    # ── Global Error Handler ──────────────────────────
+    from aiogram.exceptions import TelegramBadRequest
     from aiogram.types import ErrorEvent
-    
+
     @dp.error()
     async def global_error_handler(event: ErrorEvent, bot: Bot) -> None:
         """Log errors and notify admins."""
+        exc = event.exception
+
+        # Silently ignore expired callback query errors.
+        # Telegram expires callback queries after 30 seconds.
+        # Clicking old buttons after a bot restart causes this - it is harmless.
+        if isinstance(exc, TelegramBadRequest) and (
+            "query is too old" in str(exc).lower()
+            or "query id is invalid" in str(exc).lower()
+        ):
+            structlog.get_logger().debug(
+                "Ignored expired callback query", error=str(exc)
+            )
+            return
+
         structlog.get_logger().error(
             "Unhandled exception",
-            error=str(event.exception),
+            error=str(exc),
             event_type=type(event.update).__name__,
             exc_info=True,
         )
-        
-        # Notify admins if possible
+
+        # Notify admins for all other real errors
         for admin_id in settings.bot.admin_ids:
             try:
                 await bot.send_message(
                     admin_id,
                     f"🚨 <b>Unhandled Error</b>\n\n"
-                    f"<b>Type:</b> <code>{type(event.exception).__name__}</code>\n"
-                    f"<b>Message:</b> <code>{str(event.exception)}</code>\n\n"
+                    f"<b>Type:</b> <code>{type(exc).__name__}</code>\n"
+                    f"<b>Message:</b> <code>{str(exc)}</code>\n\n"
                     f"Check server logs for traceback."
                 )
             except Exception:
