@@ -55,12 +55,12 @@ PAYMENT_METHODS = {
     "trc20": {
         "label": "🟢 TRC-20 (Automatic)",
         "display": "TRC-20 (Tron)",
-        "value": "TYourTronWalletAddressHere", # Replace with real TRC20 address
+        "value": settings.trc20_wallet_address,
         "instructions": (
             "📌 <b>How to pay via TRC-20:</b>\n\n"
             "1️⃣ Open your wallet or exchange\n"
             "2️⃣ Send USDT on the <b>TRC-20 (Tron)</b> network to:\n"
-            "<code>TYourTronWalletAddressHere</code>\n"
+            f"<code>{settings.trc20_wallet_address}</code>\n"
             "3️⃣ Copy your <b>Transaction Hash (TxID)</b>\n"
             "4️⃣ Come back here and send it to us\n\n"
             "⚡ <i>TRC-20 deposits are verified automatically!</i>"

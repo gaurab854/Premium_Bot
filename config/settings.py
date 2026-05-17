@@ -211,6 +211,7 @@ class Settings(BaseSettings):
     debug: bool = False
     logging_level: str = "INFO"
     rate_limit: float = 0.5  # seconds between messages per user
+    trc20_wallet_address: str = ""  # Your Tron TRC-20 wallet address
 
     model_config = SettingsConfigDict(
         env_file=str(BASE_DIR / ".env"),
