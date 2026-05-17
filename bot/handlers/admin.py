@@ -10,6 +10,7 @@ Admin commands:
     /ban          — Ban a user
     /unban        — Unban a user
     /broadcast    — Send a message to all users
+    /announce     — Send a custom message to the channel as the bot
 
 Deposit callbacks:
     ✅ Approve / ❌ Reject   — inline buttons on deposit notifications
@@ -30,7 +31,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.callbacks.deposit import DepositAction, DepositCallback
 from bot.filters.admin import AdminFilter
-from bot.states.user import AddProductForm, AddStockForm
+from bot.states.user import AddProductForm, AddStockForm, AnnounceForm
 from config import settings
 from database import async_session_factory
 from database.repositories.deposit import DepositRepository
@@ -748,6 +749,90 @@ async def cmd_unban(message: Message, user_repo: UserRepository) -> None:
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer("❌ Cancelled.")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  /announce — Send a custom message to the channel as the bot
+# ═════════════════════════════════════════════════════════════════════════════
+
+@router.message(Command("announce"))
+async def cmd_announce(message: Message, state: FSMContext, bot: Bot) -> None:
+    """
+    Usage:
+        /announce Your message here   ← inline (single line)
+
+    OR just:
+        /announce
+    Then type the announcement text in the next message (supports multi-line).
+    """
+    # ── Inline usage: text after the command on the same line ──
+    parts = message.text.split(maxsplit=1)
+    if len(parts) >= 2:
+        announcement_text = parts[1].strip()
+        if announcement_text:
+            await _send_channel_announcement(message, bot, announcement_text)
+            return
+
+    # ── Multi-step usage: ask for text in next message ─────────
+    await state.set_state(AnnounceForm.waiting_for_text)
+    await message.answer(
+        "📢 <b>Channel Announcement</b>\n\n"
+        "Type the announcement message below and send it.\n"
+        "It will be posted to the channel as-is (HTML formatting supported).\n\n"
+        "<i>Send /cancel to abort.</i>"
+    )
+
+
+@router.message(AnnounceForm.waiting_for_text, Command("cancel"))
+async def cancel_announce(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("❌ Announcement cancelled.")
+
+
+@router.message(AnnounceForm.waiting_for_text, F.text & ~F.text.startswith("/"))
+async def process_announce_text(message: Message, state: FSMContext, bot: Bot) -> None:
+    """Receive the announcement text from admin and post it to the channel."""
+    announcement_text = message.text.strip()
+    await state.clear()
+    await _send_channel_announcement(message, bot, announcement_text)
+
+
+async def _send_channel_announcement(message: Message, bot: Bot, text: str) -> None:
+    """Post *text* to the configured channel and confirm to the admin."""
+    if not settings.bot.channel_id:
+        await message.answer(
+            "⚠️ No channel configured.\n"
+            "Set <code>BOT_CHANNEL_ID</code> in your .env file."
+        )
+        return
+
+    try:
+        sent = await bot.send_message(
+            settings.bot.channel_id,
+            text,
+            parse_mode="HTML",
+        )
+        await message.answer(
+            f"✅ <b>Announcement sent to channel!</b>\n\n"
+            f"📌 Message ID: <code>{sent.message_id}</code>\n"
+            f"📢 Channel: <code>{settings.bot.channel_id}</code>\n\n"
+            f"<i>Preview of what was sent:</i>\n"
+            f"─────────────────────\n"
+            f"{text[:500]}{'…' if len(text) > 500 else ''}"
+        )
+        logger.info(
+            "Channel announcement sent",
+            admin_id=message.from_user.id,
+            channel_id=settings.bot.channel_id,
+            message_id=sent.message_id,
+        )
+    except Exception as e:
+        logger.warning("Failed to send channel announcement", error=str(e))
+        await message.answer(
+            f"❌ <b>Failed to send announcement!</b>\n\n"
+            f"<b>Error:</b> <code>{e}</code>\n\n"
+            f"Make sure the bot is an <b>admin</b> in the channel."
+        )
 
 
 # ═════════════════════════════════════════════════════════════════════════════

@@ -67,3 +67,11 @@ class AddStockForm(StatesGroup):
     """
     waiting_for_codes = State()
     waiting_for_stock_count = State()
+
+
+class AnnounceForm(StatesGroup):
+    """
+    Admin announce FSM.
+    /announce → waiting_for_text → text sent to channel
+    """
+    waiting_for_text = State()

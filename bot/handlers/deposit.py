@@ -14,6 +14,7 @@ Flow:
 
 from __future__ import annotations
 
+import aiohttp
 import structlog
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
@@ -28,8 +29,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from bot.callbacks.deposit import DepositAction, DepositCallback
 from bot.states.user import DepositForm
 from config import settings
+from database import async_session_factory
 from database.repositories.deposit import DepositRepository
 from database.repositories.user import UserRepository
+from database.repositories.wallet import WalletRepository
 
 logger = structlog.get_logger()
 
@@ -38,7 +41,7 @@ router = Router(name="deposit")
 # ── Payment methods ────────────────────────────────────────────────────────
 PAYMENT_METHODS = {
     "bybit": {
-        "label": "🟡 Bybit UID",
+        "label": "🟡 Bybit UID (Manual)",
         "display": "Bybit UID",
         "value": "547991243",
         "instructions": (
@@ -49,8 +52,22 @@ PAYMENT_METHODS = {
             "4️⃣ Come back here and send it to us"
         ),
     },
+    "trc20": {
+        "label": "🟢 TRC-20 (Automatic)",
+        "display": "TRC-20 (Tron)",
+        "value": "TYourTronWalletAddressHere", # Replace with real TRC20 address
+        "instructions": (
+            "📌 <b>How to pay via TRC-20:</b>\n\n"
+            "1️⃣ Open your wallet or exchange\n"
+            "2️⃣ Send USDT on the <b>TRC-20 (Tron)</b> network to:\n"
+            "<code>TYourTronWalletAddressHere</code>\n"
+            "3️⃣ Copy your <b>Transaction Hash (TxID)</b>\n"
+            "4️⃣ Come back here and send it to us\n\n"
+            "⚡ <i>TRC-20 deposits are verified automatically!</i>"
+        ),
+    },
     "bep20": {
-        "label": "🔵 BEP-20 (USDT/BNB)",
+        "label": "🔵 BEP-20 (Manual)",
         "display": "BEP-20",
         "value": "0xe40b02a757bb2714d4671812dc66254dd1e8ebd9",
         "instructions": (
@@ -62,20 +79,40 @@ PAYMENT_METHODS = {
             "4️⃣ Come back here and send it to us"
         ),
     },
-    "plasma": {
-        "label": "🟣 Plasma (USDT)",
-        "display": "Plasma (USDT)",
-        "value": "0xe40b02a757bb2714d4671812dc66254dd1e8ebd9",
-        "instructions": (
-            "📌 <b>How to pay via Plasma (USDT):</b>\n\n"
-            "1️⃣ Open your Plasma-compatible wallet\n"
-            "2️⃣ Send <b>USDT</b> on the Plasma network to:\n"
-            "<code>0xe40b02a757bb2714d4671812dc66254dd1e8ebd9</code>\n"
-            "3️⃣ Copy your <b>Transaction Hash (TxID)</b>\n"
-            "4️⃣ Come back here and send it to us"
-        ),
-    },
 }
+
+async def verify_tron_txid(txid: str, expected_amount: float, your_wallet: str) -> bool:
+    """
+    Queries the Tronscan API to verify if a given TXID is a valid, 
+    confirmed transfer of USDT to the specified wallet.
+    """
+    url = f"https://apilist.tronscanapi.com/api/transaction-info?hash={txid}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status != 200:
+                    return False
+                data = await resp.json()
+        
+        # 1. Check if the transaction is confirmed on-chain
+        if data.get("confirmed") != True:
+            return False
+
+        # 2. Iterate through TRC20 transfers to find matching recipient and amount
+        for transfer in data.get("trc20TransferInfo", []):
+            to_address = transfer.get("to_address", "").lower()
+            amount_str = transfer.get("amount_str", "0")
+            
+            # USDT has 6 decimals, so divide by 1_000_000
+            actual_amount = float(amount_str) / 1_000_000
+            
+            if to_address == your_wallet.lower() and actual_amount >= expected_amount:
+                return True
+                
+        return False
+    except Exception as e:
+        logger.error("Error verifying Tron TXID", txid=txid, error=str(e))
+        return False
 
 
 def _payment_method_keyboard():
@@ -243,6 +280,55 @@ async def process_txid(
     method_key = fsm_data.get("payment_method", "bep20")
     method = PAYMENT_METHODS[method_key]
 
+    # ── Auto-Verification Logic for TRC-20 ──
+    if method_key == "trc20":
+        wait_msg = await message.answer("⏳ Verifying your transaction on the blockchain...")
+        
+        is_valid = await verify_tron_txid(txid, amount, method["value"])
+        
+        if is_valid:
+            # ✅ Transaction is valid! Auto-approve it.
+            deposit = await deposit_repo.create(
+                user_id=db_user.id,
+                txid=txid,
+                amount=amount,
+            )
+            
+            # Immediately mark as approved and credit wallet using atomic transaction
+            async with async_session_factory() as session:
+                async with session.begin():
+                    # We need the repository instance tied to this session
+                    session_deposit_repo = DepositRepository(session)
+                    wallet_repo = WalletRepository(session)
+                    
+                    await session_deposit_repo.approve(
+                        deposit.id, note="Auto-approved via TronScan API"
+                    )
+                    
+                    wallet = await wallet_repo.get_or_create(user_id=db_user.id)
+                    await wallet_repo.add_balance(wallet.id, amount)
+
+            logger.info("Deposit auto-approved", txid=txid, user_id=db_user.id, amount=amount)
+            await wait_msg.delete()
+            await message.answer(
+                f"✅ <b>Deposit Verified Automatically!</b>\n\n"
+                f"<b>Amount:</b> ${amount:.2f} has been credited to your wallet.\n"
+                f"Use /shop to start purchasing.",
+                parse_mode="HTML",
+            )
+            await state.clear()
+            return
+            
+        else:
+            await wait_msg.delete()
+            await message.answer(
+                "⚠️ <b>Automatic Verification Failed.</b>\n"
+                "We couldn't verify this transaction automatically. "
+                "It has been submitted for manual review by an admin."
+            )
+            # Fall through to manual review flow
+
+    # ── Manual Review Flow (for other methods or failed TRC20 verification) ──
     deposit = await deposit_repo.create(
         user_id=db_user.id,
         txid=txid,
@@ -250,7 +336,7 @@ async def process_txid(
     )
 
     logger.info(
-        "Deposit created",
+        "Deposit created (pending)",
         deposit_id=deposit.id,
         user_id=db_user.id,
         method=method_key,
