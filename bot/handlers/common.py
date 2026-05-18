@@ -10,6 +10,7 @@ Channel-join gate:
 from __future__ import annotations
 
 from aiogram import Bot, Router, F
+from aiogram.fsm.context import FSMContext
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     InlineKeyboardButton,
@@ -182,174 +183,50 @@ async def check_membership_callback(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Inline quick-access callbacks from /start buttons
+#  Inline button callbacks — delegate directly to the real command functions
+#  so there is zero duplicate logic anywhere.
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.callback_query(F.data == "my_balance")
-async def cb_my_balance(
-    callback: CallbackQuery,
-    user_repo: UserRepository,
-    wallet_repo: WalletRepository,
-) -> None:
-    db_user = await user_repo.get_by_telegram_id(callback.from_user.id)
-    if not db_user:
-        await callback.answer("Please /start first.", show_alert=True)
-        return
-    balance = await wallet_repo.get_balance(user_id=db_user.id)
-    await callback.answer(f"💰 Your Balance: ${balance:.2f}", show_alert=True)
-
-
-@router.callback_query(F.data == "my_profile")
-async def cb_my_profile(
-    callback: CallbackQuery,
-    user_repo: UserRepository,
-    wallet_repo: WalletRepository,
-) -> None:
-    db_user = await user_repo.get_by_telegram_id(callback.from_user.id)
-    if not db_user:
-        await callback.answer("Please /start first.", show_alert=True)
-        return
-    balance = await wallet_repo.get_balance(user_id=db_user.id)
-    await callback.message.answer(
-        f"👤 <b>Your Profile</b>\n\n"
-        f"<b>Telegram ID:</b>  <code>{db_user.telegram_id}</code>\n"
-        f"<b>Name:</b>         {db_user.first_name} {db_user.last_name or ''}\n"
-        f"<b>Username:</b>     @{db_user.username or '—'}\n"
-        f"<b>Admin:</b>        {'✅' if db_user.is_admin else '❌'}\n"
-        f"<b>Balance:</b>      ${balance:.2f}\n"
-        f"<b>Registered:</b>   {db_user.created_at:%Y-%m-%d %H:%M UTC}\n",
-    )
+@router.callback_query(F.data == "open_deposit")
+async def cb_open_deposit(callback: CallbackQuery, state: FSMContext) -> None:
+    from bot.handlers.deposit import cmd_deposit
+    await cmd_deposit(callback.message, state)
     await callback.answer()
 
 
-@router.callback_query(F.data == "open_deposit")
-async def cb_open_deposit(
-    callback: CallbackQuery,
-    user_repo: UserRepository,
-    wallet_repo: WalletRepository,
-) -> None:
-    """Show the deposit screen with payment method buttons — same as /deposit."""
-    db_user = await user_repo.get_by_telegram_id(callback.from_user.id)
-    balance = 0.0
-    if db_user:
-        balance = await wallet_repo.get_balance(user_id=db_user.id)
+@router.callback_query(F.data == "open_shop")
+async def cb_open_shop(callback: CallbackQuery, product_repo: ProductRepository, inventory_repo: InventoryRepository) -> None:
+    from bot.handlers.purchase import cmd_shop
+    await cmd_shop(callback.message, product_repo, inventory_repo)
+    await callback.answer()
 
-    PAYMENT_METHODS = {
-        "bybit": "🟡 Bybit UID",
-        "bep20": "🔵 BEP-20 (USDT/BNB)",
-        "plasma": "🟣 Plasma (USDT)",
-    }
 
-    builder = InlineKeyboardBuilder()
-    for key, label in PAYMENT_METHODS.items():
-        builder.row(
-            InlineKeyboardButton(
-                text=label,
-                callback_data=f"pay_method:{key}",
-            )
-        )
-    builder.row(
-        InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_deposit"),
-    )
-
-    await callback.message.answer(
-        f"💳 <b>Add Funds — Choose Payment Method</b>\n\n"
-        f"<b>Your Balance:</b> ${balance:.2f}\n\n"
-        f"Select how you would like to pay:",
-        reply_markup=builder.as_markup(),
-    )
+@router.callback_query(F.data == "my_balance")
+async def cb_my_balance(callback: CallbackQuery, user_repo: UserRepository, wallet_repo: WalletRepository) -> None:
+    await cmd_balance(callback.message, user_repo, wallet_repo)
     await callback.answer()
 
 
 @router.callback_query(F.data == "my_orders")
-async def cb_my_orders(
-    callback: CallbackQuery,
-    user_repo: UserRepository,
-    order_repo: OrderRepository,
-) -> None:
-    db_user = await user_repo.get_by_telegram_id(callback.from_user.id)
-    if not db_user:
-        await callback.answer("Please /start first.", show_alert=True)
-        return
-    orders = await order_repo.get_by_user(db_user.id, limit=10)
-    if not orders:
-        await callback.message.answer(
-            "📋 <b>Order History</b>\n\nYou haven't made any purchases yet.\n"
-            "Use /shop to browse products!"
-        )
-    else:
-        lines = ["📋 <b>Your Recent Orders</b>\n"]
-        for o in orders:
-            emoji = {"completed": "✅", "pending": "⏳", "cancelled": "❌", "refunded": "🔄"}.get(
-                o.status.value, "❓"
-            )
-            lines.append(
-                f"{emoji} <b>Order #{o.id}</b> — ${o.total_amount:.2f} — "
-                f"{o.created_at:%Y-%m-%d %H:%M}"
-            )
-        await callback.message.answer("\n".join(lines))
+async def cb_my_orders(callback: CallbackQuery, user_repo: UserRepository, order_repo: OrderRepository) -> None:
+    from bot.handlers.purchase import cmd_orders
+    await cmd_orders(callback.message, user_repo, order_repo)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "my_profile")
+async def cb_my_profile(callback: CallbackQuery, user_repo: UserRepository, wallet_repo: WalletRepository) -> None:
+    await cmd_me(callback.message, user_repo, wallet_repo)
     await callback.answer()
 
 
 @router.callback_query(F.data == "open_help")
 async def cb_open_help(callback: CallbackQuery) -> None:
-    text = (
-        "📖 <b>Available Commands</b>\n\n"
-        "👤 <b>Account</b>\n"
-        "/start    — Register & welcome\n"
-        "/me       — Your profile info\n"
-        "/balance  — Check wallet balance\n\n"
-        "🏪 <b>Shopping</b>\n"
-        "/shop     — Browse products\n"
-        "/orders   — Your purchase history\n\n"
-        "💰 <b>Wallet</b>\n"
-        "/deposit  — Add funds to your wallet\n\n"
-        "📋 <b>Other</b>\n"
-        "/help     — Show this help message\n"
-    )
-    await callback.message.answer(text)
+    await cmd_help(callback.message)
     await callback.answer()
 
 
-@router.callback_query(F.data == "open_shop")
-async def cb_open_shop(
-    callback: CallbackQuery,
-    product_repo: ProductRepository,
-    inventory_repo: InventoryRepository,
-) -> None:
-    """Render the shop directly — same as /shop command."""
-    products = await product_repo.get_available()
 
-    if not products:
-        await callback.message.answer(
-            "🏪 <b>Shop</b>\n\nNo products available at the moment. Check back later!"
-        )
-        await callback.answer()
-        return
-
-    builder = InlineKeyboardBuilder()
-    lines: list[str] = ["🏪 <b>Available Products</b>\n"]
-
-    for p in products:
-        stock = await inventory_repo.count_available(p.id)
-        stock_label = f"({stock} in stock)" if stock > 0 else "(OUT OF STOCK)"
-        lines.append(f"• <b>{p.name}</b> — ${p.price:.2f}  {stock_label}")
-        builder.row(
-            InlineKeyboardButton(
-                text=f"🔍 {p.name}",
-                callback_data=ProductCallback(
-                    action=ProductAction.VIEW,
-                    product_id=p.id,
-                ).pack(),
-            )
-        )
-
-    lines.append("\n<i>Tap a product to view details and purchase.</i>")
-    await callback.message.answer(
-        "\n".join(lines),
-        reply_markup=builder.as_markup(),
-    )
-    await callback.answer()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
