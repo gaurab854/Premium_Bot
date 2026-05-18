@@ -245,12 +245,29 @@ async def _run_polling(bot: Bot, dp: Dispatcher, redis: Redis) -> None:
     structlog.get_logger().info(
         "Starting in POLLING mode",
     )
+
+    # Start a simple health check server in the background for Docker health checks
+    health_app = web.Application()
+    async def health_handler(request: web.Request) -> web.Response:
+        return web.json_response({"status": "ok", "mode": "polling"})
+    health_app.router.add_get("/health", health_handler)
+
+    runner = web.AppRunner(health_app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=8443)
+    await site.start()
+    structlog.get_logger().info(
+        "Polling healthcheck server running",
+        listen="0.0.0.0:8443",
+    )
+
     try:
         await dp.start_polling(
             bot,
             allowed_updates=dp.resolve_used_update_types(),
         )
     finally:
+        await runner.cleanup()
         await bot.session.close()
         await redis.aclose()
 
