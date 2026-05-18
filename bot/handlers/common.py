@@ -247,6 +247,8 @@ async def cmd_help(message: Message) -> None:
         "/orders   — Your purchase history\n\n"
         "💰 <b>Wallet</b>\n"
         "/deposit  — Add funds to your wallet\n\n"
+        "🛡️ <b>Support</b>\n"
+        "/contact  — Warranty support & replacement\n\n"
         "📋 <b>Other</b>\n"
         "/help     — Show this help message\n"
     )
@@ -293,6 +295,25 @@ async def cmd_balance(
 
     balance = await wallet_repo.get_balance(user_id=db_user.id)
     await message.answer(f"💰 <b>Your Balance:</b> <code>${balance:.2f}</code>")
+
+
+@router.message(Command("contact"))
+async def cmd_contact(message: Message) -> None:
+    """Show warranty support contact info."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="💬 Contact @Randompliw",
+            url="https://t.me/Randompliw",
+        )
+    )
+    await message.answer(
+        "🛡️ <b>Warranty Support</b>\n\n"
+        "For product replacements or warranty claims, contact our admin directly:\n\n"
+        "👤 <b>@Randompliw</b>\n\n"
+        "<i>Please include your Order ID and a description of the issue.</i>",
+        reply_markup=builder.as_markup(),
+    )
 
 
 @router.message()

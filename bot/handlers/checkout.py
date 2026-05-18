@@ -36,24 +36,7 @@ logger = structlog.get_logger()
 
 router = Router(name="checkout")
 
-# ── Payment info (shown if insufficient balance) ──────────────────────────────
-PAYMENT_INFO = {
-    "bybit": {
-        "label": "🟡 Bybit UID",
-        "value": "547991243",
-        "note": "Transfer via Bybit P2P/Assets to this UID, then use /deposit to submit your TXID.",
-    },
-    "bep20": {
-        "label": "🔵 BEP-20 (USDT/BNB)",
-        "value": "0xe40b02a757bb2714d4671812dc66254dd1e8ebd9",
-        "note": "Send USDT/BNB on BSC network to the address above, then use /deposit.",
-    },
-    "plasma": {
-        "label": "🟣 Plasma",
-        "value": "0xe40b02a757bb2714d4671812dc66254dd1e8ebd9",
-        "note": "Send to the address above via Plasma network, then use /deposit.",
-    },
-}
+
 
 
 @router.callback_query(ProductCallback.filter(F.action == ProductAction.BUY))
@@ -125,7 +108,10 @@ async def on_buy_clicked(
         new_balance = wallet.balance - product.price
 
         # Check Category
-        is_gmail = product.category and product.category.upper() == "GMAIL"
+        is_gmail        = product.category and "GMAIL" in product.category.upper()
+        is_full_warranty = product.category and product.category.upper() in (
+            "FULL WARRANTY", "FULL_WARRANTY", "FULLWARRANTY"
+        )
 
         if is_gmail:
             await callback.message.edit_text(
@@ -142,6 +128,36 @@ async def on_buy_clicked(
             await state.set_state(CheckoutForm.waiting_for_gmail)
             await state.update_data(checkout_order_id=order.id, checkout_product_name=product.name)
             await callback.answer("✅ Purchase complete! Please provide your Gmail.")
+
+        elif is_full_warranty:
+            await callback.message.edit_text(
+                f"🎉 <b>Purchase Successful!</b>\n\n"
+                f"<b>Product:</b>  {product.name}\n"
+                f"<b>Price:</b>    ${product.price:.2f}\n"
+                f"<b>Order:</b>    #{order.id}\n"
+                f"🛡️ <b>Full Warranty</b> included!"
+            )
+            # Build contact button
+            kb = InlineKeyboardBuilder()
+            kb.row(
+                InlineKeyboardButton(
+                    text="📞 Contact Support for Replacement",
+                    url="https://t.me/Randompliw",
+                )
+            )
+            await callback.message.answer(
+                f"🔐 <b>Your Digital Code</b>\n\n"
+                f"<b>Product:</b> {product.name}\n"
+                f"<b>Order:</b>   #{order.id}\n\n"
+                f"<tg-spoiler>{locked_item.data}</tg-spoiler>\n\n"
+                f"<i>⚠️ Save this code — it will not be shown again.</i>\n"
+                f"<i>💰 Remaining balance: ${new_balance:.2f}</i>\n\n"
+                f"🛡️ This product comes with <b>Full Warranty</b>.\n"
+                f"If you face any issues, use /contact or tap the button below.",
+                reply_markup=kb.as_markup(),
+            )
+            await callback.answer("✅ Purchase complete!")
+
         else:
             await callback.message.edit_text(
                 f"🎉 <b>Purchase Successful!</b>\n\n"

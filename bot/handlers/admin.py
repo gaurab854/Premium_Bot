@@ -124,15 +124,28 @@ async def process_product_price(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"✅ Price: <b>${price:.2f}</b>\n\n"
         "<b>Step 3/5</b> — Choose the <b>category</b>:\n\n"
-        "Reply with either <code>LINK</code> or <code>GMAIL</code>."
+        "<code>a</code> — Link / ID Pass\n"
+        "<code>b</code> — Gmail Invite\n"
+        "<code>c</code> — Full Warranty ID Pass"
     )
 
 
 @router.message(AddProductForm.waiting_for_category, F.text & ~F.text.startswith("/"))
 async def process_product_category(message: Message, state: FSMContext) -> None:
-    category = message.text.strip().upper()
-    if category not in ("LINK", "GMAIL"):
-        await message.answer("⚠️ Please reply with either <code>LINK</code> or <code>GMAIL</code>.")
+    CATEGORY_MAP = {
+        "a": "LINK / ID PASS",
+        "b": "GMAIL INVITE",
+        "c": "FULL WARRANTY",
+    }
+    choice = message.text.strip().lower()
+    category = CATEGORY_MAP.get(choice)
+    if not category:
+        await message.answer(
+            "⚠️ Please reply with:\n"
+            "<code>a</code> — Link / ID Pass\n"
+            "<code>b</code> — Gmail Invite\n"
+            "<code>c</code> — Full Warranty ID Pass"
+        )
         return
 
     await state.update_data(product_category=category)
@@ -153,20 +166,28 @@ async def process_product_description(message: Message, state: FSMContext) -> No
     fsm_data = await state.get_data()
     category = fsm_data.get("product_category")
 
-    if category == "GMAIL":
+    if category == "GMAIL INVITE":
         await state.set_state(AddProductForm.waiting_for_stock_count)
         await message.answer(
             f"✅ Description saved.\n\n"
-            "<b>Step 5/5</b> — How many stocks (invitations) are available?\n\n"
+            "<b>Step 5/5</b> — How many Gmail invitation slots are available?\n\n"
             "<i>Enter a number (e.g. 50).</i>"
         )
-    else:
+    elif category == "FULL WARRANTY":
         await state.set_state(AddProductForm.waiting_for_codes)
         await message.answer(
             f"✅ Description saved.\n\n"
-            "<b>Step 5/5</b> — Now enter the <b>inventory codes</b> (the digital goods/slots).\n\n"
+            "<b>Step 5/5</b> — Enter the <b>inventory codes</b> for this Full Warranty product.\n\n"
+            "📋 Send <b>one code per line</b> (e.g. <code>user:pass</code>):\n\n"
+            "<i>Each line = one unit of stock. You can add more later with /addstock.</i>"
+        )
+    else:  # LINK / ID PASS
+        await state.set_state(AddProductForm.waiting_for_codes)
+        await message.answer(
+            f"✅ Description saved.\n\n"
+            "<b>Step 5/5</b> — Now enter the <b>inventory codes</b> (links or id:pass).\n\n"
             "📋 Send <b>one code per line</b>:\n"
-            "<code>CODE1234\nCODE5678\nCODE9012</code>\n\n"
+            "<code>user:pass\nuser2:pass2</code>\n\n"
             "<i>Each line = one unit of stock. You can add more later with /addstock.</i>"
         )
 
@@ -417,7 +438,7 @@ async def cmd_addstock(
 
     await state.update_data(addstock_product_id=product_id)
 
-    if product.category == "GMAIL":
+    if product.category and "GMAIL" in product.category.upper():
         await state.set_state(AddStockForm.waiting_for_stock_count)
         await message.answer(
             f"📦 <b>Adding stock to: {product.name}</b>\n"
@@ -972,4 +993,63 @@ async def handle_deposit_decision(
         )
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  /fw — List all Full Warranty purchases
+# ═════════════════════════════════════════════════════════════════════════════
 
+@router.message(Command("fw"))
+async def cmd_fw(message: Message) -> None:
+    """Show all Full Warranty purchases in a simple tabular format."""
+    from sqlalchemy import select
+    from database.models.order_item import OrderItem
+    from database.models.order import Order
+    from database.models.product import Product
+    from database.models.inventory import Inventory
+    from database.models.user import User
+
+    async with async_session_factory() as session:
+        stmt = (
+            select(
+                Product.name,
+                Inventory.data,
+                User.telegram_id,
+                User.username,
+            )
+            .join(OrderItem, OrderItem.inventory_id == Inventory.id)
+            .join(Order, Order.id == OrderItem.order_id)
+            .join(Product, Product.id == OrderItem.product_id)
+            .join(User, User.id == Order.user_id)
+            .where(
+                Inventory.is_sold.is_(True),
+                Product.category.ilike("FULL%WARRANTY"),
+            )
+            .order_by(Order.created_at.desc())
+        )
+        result = await session.execute(stmt)
+        rows = result.all()
+
+    if not rows:
+        await message.answer(
+            "🛡️ <b>Full Warranty Purchases</b>\n\n"
+            "No full warranty purchases found yet."
+        )
+        return
+
+    # Build output — chunk into 20 rows to stay under Telegram's message limit
+    CHUNK = 20
+    total = len(rows)
+    for start in range(0, total, CHUNK):
+        chunk = rows[start : start + CHUNK]
+        lines = [
+            f"🛡️ <b>Full Warranty Purchases</b> "
+            f"({start + 1}–{min(start + CHUNK, total)} of {total})\n",
+        ]
+        for i, (prod_name, code, tg_id, username) in enumerate(chunk, start=start + 1):
+            prod_short = (prod_name or "Unknown")[:28]
+            buyer      = f"@{username}" if username else f"UID:{tg_id}"
+            lines.append(
+                f"<b>{i}. {prod_short}</b>\n"
+                f"   👤 {buyer}\n"
+                f"   🔑 <tg-spoiler>{code}</tg-spoiler>"
+            )
+        await message.answer("\n\n".join(lines))
