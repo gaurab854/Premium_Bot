@@ -23,6 +23,7 @@ from bot.callbacks.checkout import (
     GmailInviteCallback,
 )
 from bot.callbacks.purchase import ProductAction, ProductCallback
+from bot.handlers.deposit import PAYMENT_METHODS
 from bot.states.user import CheckoutForm
 from config import settings
 from database import async_session_factory
@@ -225,10 +226,10 @@ async def on_pay_method_info(callback: CallbackQuery, state: FSMContext) -> None
     # Format: checkout_pay_method:<product_id>:<method_key>
     product_id = int(parts[1])
     method_key = parts[2]
-    info = PAYMENT_INFO.get(method_key)
+    method = PAYMENT_METHODS.get(method_key)
 
-    if not info:
-        await callback.answer("Unknown method.", show_alert=True)
+    if not method:
+        await callback.answer("Unknown payment method.", show_alert=True)
         return
 
     # Start the deposit FSM so the user can paste their TXID immediately
@@ -241,9 +242,7 @@ async def on_pay_method_info(callback: CallbackQuery, state: FSMContext) -> None
     )
 
     await callback.message.edit_text(
-        f"{info['label']}\n\n"
-        f"<b>Send to:</b>\n<code>{info['value']}</code>\n\n"
-        f"ℹ️ {info['note']}\n\n"
+        f"{method['instructions']}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 <b>How much are you depositing? (in USD)</b>\n\n"
         f"<i>Reply with the amount, e.g. 25.00</i>\n"
@@ -275,10 +274,10 @@ async def on_back_to_checkout(
     stock = await inventory_repo.count_available(product_id)
 
     builder = InlineKeyboardBuilder()
-    for key, info in PAYMENT_INFO.items():
+    for key, method in PAYMENT_METHODS.items():
         builder.row(
             InlineKeyboardButton(
-                text=info["label"],
+                text=method["label"],
                 callback_data=f"checkout_pay_method:{product.id}:{key}",
             )
         )

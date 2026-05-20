@@ -220,7 +220,7 @@ async def process_amount(message: Message, state: FSMContext) -> None:
     await state.set_state(DepositForm.waiting_for_txid)
 
     await message.answer(
-        f"✅ Amount: <b>${amount:.2f}</b>\n"
+        f"✅ <b>Amount: <u>${amount:.2f}</u></b>\n"
         f"Method: <b>{method['display']}</b>\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📋 Now send your <b>Transaction Hash / TXID</b> "
@@ -229,6 +229,20 @@ async def process_amount(message: Message, state: FSMContext) -> None:
         f"<i>Paste the full hash — it will be verified by an admin.</i>\n\n"
         f"Send /cancel to abort."
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CANCEL — abort the deposit flow from any state
+#  IMPORTANT: These must be registered BEFORE process_txid so that the
+#  Command("cancel") filter wins over the generic F.text filter.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.message(DepositForm.waiting_for_amount, Command("cancel"))
+@router.message(DepositForm.waiting_for_txid, Command("cancel"))
+async def cmd_cancel_deposit(message: Message, state: FSMContext) -> None:
+    """Cancel the deposit flow at any stage."""
+    await state.clear()
+    await message.answer("❌ Deposit cancelled.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -248,6 +262,15 @@ async def process_txid(
     with Approve / Reject inline buttons.
     """
     txid = message.text.strip()
+
+    # Guard: never treat a command as a TXID.
+    # This is a safety net — the cancel handler above should catch /cancel first.
+    if txid.startswith("/"):
+        await message.answer(
+            "⚠️ That doesn't look like a transaction hash.\n"
+            "Send /cancel to abort the deposit."
+        )
+        return
 
     if len(txid) < 6:
         await message.answer(
@@ -403,13 +426,4 @@ async def process_txid(
             )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  CANCEL — abort the deposit flow from any state
-# ─────────────────────────────────────────────────────────────────────────────
 
-@router.message(DepositForm.waiting_for_amount, Command("cancel"))
-@router.message(DepositForm.waiting_for_txid, Command("cancel"))
-async def cmd_cancel_deposit(message: Message, state: FSMContext) -> None:
-    """Cancel the deposit flow at any stage."""
-    await state.clear()
-    await message.answer("❌ Deposit cancelled.")
